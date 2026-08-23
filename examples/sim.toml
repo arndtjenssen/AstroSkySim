@@ -1,0 +1,221 @@
+seed = 1234
+
+[server]
+host = "0.0.0.0"
+port = 7625
+tick_hz = 10.0
+
+[site]
+latitude = 49.39
+longitude = 8.86
+elevation = 300.0
+
+[telescope]
+focal_length_mm = 432.0
+aperture_mm = 90.0
+# Off-axis guider: the guide camera looks through the OTA above, so it inherits
+# both values and TELESCOPE_INFO reports them as GUIDER_APERTURE /
+# GUIDER_FOCAL_LENGTH. Uncomment for a separate guide scope instead, which gives
+# the guide camera its own plate scale.
+# guide_focal_length_mm = 240.0
+# guide_aperture_mm = 60.0
+
+# IMX533
+[sensor]
+width_px = 3008
+height_px = 3008
+pixel_size_um = 3.76
+bayer = "MONO"       # or RGGB / BGGR / GRBG / GBRG
+bit_depth = 16
+well_depth_e = 73000.0
+read_noise_e = 1.5
+hot_pixels = 20
+# Dark current of a hot pixel, e-/s, scaled by exposure time. Keep this well
+# below well_depth_e / (guide exposure) or the immobile hot pixels outshine
+# every star and a guider will calibrate against fixed-pattern noise.
+hot_pixel_e_s = 200.0
+
+# IMX678 - guide cam - every key from [sensor] is accepted here
+[sensor_guide_cam]
+width_px = 1936
+height_px = 1096
+pixel_size_um = 2.9      # 0.85"/px through the 700 mm OTA - oversampled, as an
+                         # OAG guider is; bin 2x2 from the client to fix that
+bayer = "MONO"
+bit_depth = 16
+well_depth_e = 12000.0   # small pixels, shallow well
+read_noise_e = 2.6       # noisier than the imaging chip
+hot_pixels = 12
+hot_pixel_e_s = 200.0
+
+[optics]
+seeing_arcsec = 2.5
+# Sky brightness as an SQM reading, converted to e-/px/s through the aperture,
+# plate scale, throughput and whatever filter is in the beam. 21.0 is rural,
+# 20.0 suburban, 18.0 a city centre. On this rig 21.0 is 0.41 e-/px/s.
+#
+# There is also `sky_background`, which sets that electron rate directly and
+# overrides this. Do not confuse the two: `sky_background = 21.0` is not an SQM
+# 21 sky, it is roughly SQM 18. The startup log says which one is in use.
+sky_mag_arcsec2 = 21.0
+
+# Optical + quantum efficiency before any filter, and the e-/s/m2 a magnitude 0
+# source delivers. Together they set the absolute scale for stars, sky and
+# survey nebulosity alike - change one and all three move together.
+throughput = 0.5
+zero_point_e_s_m2 = 1.0e10
+
+# Only for a separate guide scope, which holds its own focus: it pins the guide
+# star's HFD so the imaging focuser cannot blur it. Leave it out for an off-axis
+# guider - the prism is downstream of the focuser, so an autofocus run really
+# does bloat the guide star, and Ekos really does suspend guiding for it.
+# guide_hfd_px = 3.5
+
+[focuser]
+max_position = 30000
+perfect_focus = 15000
+focus_range = 1000    # steps off focus that give HFD ~10
+backlash = 40
+speed_steps_s = 2000.0
+
+[rotator]
+speed_deg_s = 4.0
+mechanical_offset = 0.0
+
+[filter_wheel]
+names = ["L", "R", "G", "B", "Ha", "OIII", "SII"]
+focus_offsets = [0, 0, 0, 0, 120, 120, 120]
+# Fraction of the unfiltered light each filter passes, applied to stars,
+# nebulosity and sky together. R/G/B each take about a third of a luminance
+# band; a 3 nm Ha passes ~1% of it in continuum, so an Ha sub needs minutes
+# where an L sub needs seconds. Omit the line for a wheel with no losses.
+# The guide camera is unaffected - its pickoff prism is upstream of the wheel.
+transmission = [1.0, 0.3, 0.3, 0.3, 0.02, 0.02, 0.02]
+change_time_s = 1.5
+
+[mount]
+slew_rate_deg_s = 3.0
+guide_rate = 0.5
+periodic_error_amplitude = 4.0    # arcsec, gives guiding something to chase
+periodic_error_period = 480.0
+tracking_noise = 0.5              # arcsec RMS
+azimuth_error = 20.0               # arcmin of polar misalignment
+elevation_error = 30.0
+
+[source]
+# artificial | dss | composite
+mode = "dss"
+
+[source.artificial]
+# Point this at your HNSKY .290 files; without them a synthetic field is used.
+catalog_dir = "./catalog"
+catalog = "g14"
+limiting_mag = 16.0
+allow_synthetic_fallback = true
+
+[source.dss]
+# "<backend>:<survey>" - hips (CDS hips2fits), skyview or eso.
+#   survey = "hips:dss2r"                    short name
+#   survey = "hips:CDS/P/PanSTARRS/DR1/r"    any id from aladin.cds.unistra.fr/hips/list
+#   survey = "hips:ha" / "hips:oiii" / "hips:sii"     narrowband
+#   survey = "skyview:DSS2 Red"              SkyView names contain spaces
+#   survey = "eso:DSS"
+# Monochrome HiPS only: the ".../color" ones are 8-bit RGBA transcoded from JPEG
+# and are rejected at decode.
+survey = "hips:CDS/P/DSS2/red"
+# Downloads are keyed on the pointing snapped to a grid, so tracking noise does
+# not defeat the cache. ~ is expanded.
+cache_dir = "~/.cache/astroskysim"
+timeout_s = 60.0
+fallback_to_artificial = true
+# Refuse a cutout covering less than this much of the sensor, instead of serving
+# a frame that is mostly black hole. Partial-sky surveys, and surveys that mask
+# their saturated cores (PanSTARRS over M42), hit this.
+min_coverage = 0.5
+# hips2fits resamples to whatever grid it is asked for; this caps the request.
+max_download_px = 3000
+# Photometric anchor. The survey's own sky level is estimated and subtracted,
+# and what is left is scaled so that the reference level stands for a surface
+# brightness of `ref_mag_arcsec2`. Everything else - aperture, plate scale,
+# throughput, filter, exposure - then follows from the optics, so a 1 s sub of
+# IC 1805 is empty and a 20 s one is faintly there, as on the sky.
+# Raise the magnitude to dim the nebulosity, lower it to brighten it.
+#
+# The reference level is `ref_value` (raw survey units above the survey's own
+# sky) when set, otherwise `ref_percentile` of the frame. Prefer `ref_value` on
+# a linear survey: the percentile normalises every cutout against itself, so an
+# empty field comes out as bright as M42 and each band of a survey comes out as
+# bright as every other. DSS2 is photographic and per-plate scaled, so it gets
+# the percentile here; NSNS is linear and cross-calibrated, so it gets a value.
+ref_mag_arcsec2 = 19.3
+ref_percentile = 99.0
+ref_value = 5000.0
+
+# --- one survey per filter -------------------------------------------------
+# Keyed by the names in [filter_wheel]; a typo is a startup error, not a silent
+# fallback. Unlisted filters and the *guide camera* use the default above (the
+# OAG prism is upstream of the wheel, so the guider never sees a filter).
+#
+# A matched survey is `in_band` by default, meaning the filter's `transmission`
+# does not dim it: a 3 nm Ha filter selects the Ha line rather than throwing it
+# away. Stars and sky are still attenuated, which is exactly why narrowband
+# works - the nebula stays, everything else drops fifty-fold.
+#
+# Caveats worth knowing before you trust a frame:
+#  * NSNS is 6.4"/px against DSS2's 0.8", so narrowband frames are soft and its
+#    stars are blobs. Use `mode = "composite"` to get catalogue stars instead.
+#  * NSNS covers ~65% of the sky (northern). Below its footprint the fetch
+#    fails and `fallback_to_artificial` serves a star field with no nebulosity.
+#  * There is no green plate. DSS2 goes blue (468-491 nm) then jumps to red
+#    (640-658), so G and B below share one image and differ only in anchor -
+#    an honest gap, not a fix. PanSTARRS g is a real green-blue band, but its
+#    99th percentile is stellar peaks even in an empty field, so anchoring on
+#    it yields sharp stars over near-zero nebulosity. Use it when you want
+#    depth and resolution for focus and plate-solve work, not for nebulosity.
+
+# Luminance: no survey is an L band. DSS2 red is the practical stand-in - all
+# sky, sharp, and its passband contains Ha so emission nebulae actually show.
+# 1.2 mag brighter than R below, because L passes roughly three times the band.
+[source.dss.per_filter.L]
+survey = "hips:CDS/P/DSS2/red"
+ref_mag_arcsec2 = 19.3
+ref_value = 5000.0
+
+[source.dss.per_filter.R]
+survey = "hips:CDS/P/DSS2/red"
+ref_mag_arcsec2 = 20.5
+ref_value = 5000.0
+
+[source.dss.per_filter.G]
+survey = "hips:CDS/P/DSS2/blue"
+ref_mag_arcsec2 = 22.0
+ref_value = 4000.0
+
+[source.dss.per_filter.B]
+survey = "hips:CDS/P/DSS2/blue"
+ref_mag_arcsec2 = 22.5
+ref_value = 4000.0
+
+# The three NSNS line maps share one linear scale, so they share one anchor and
+# the *survey* supplies the line ratio. Nothing here says "OIII is weak"; it
+# comes out weak on IC 1805 and strong on M27 because that is what the sky does.
+[source.dss.per_filter.Ha]
+survey = "hips:simg.de/P/NSNS/DR0_2/halpha"
+ref_mag_arcsec2 = 19.5
+ref_value = 1000.0
+
+[source.dss.per_filter.OIII]
+survey = "hips:simg.de/P/NSNS/DR0_2/oiii"
+ref_mag_arcsec2 = 19.5
+ref_value = 1000.0
+
+[source.dss.per_filter.SII]
+survey = "hips:simg.de/P/NSNS/DR0_2/sii"
+ref_mag_arcsec2 = 19.5
+ref_value = 1000.0
+
+[source.composite]
+background_weight = 1.0
+star_weight = 1.0
+# Subtract the survey's own stars so they do not stack with the rendered ones.
+suppress_background_stars = true
