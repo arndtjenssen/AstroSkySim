@@ -1,0 +1,22 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+.pytest_cache
+.ruff_cache
+.claude/
+build/
+dist/
+wheels/
+*.egg-info
+catalog/*
+!catalog/README.md
+examples/*
+!examples/sim.toml
+
+# Virtual environments
+.venv
+
+# Misc
+.playwright-cli
+.agents
+
