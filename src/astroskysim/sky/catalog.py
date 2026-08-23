@@ -189,7 +189,22 @@ class StarCatalog:
     """Cell-cached reader over a directory of ``.290`` files."""
 
     #: Fallback order, matching ``select_star_database``.
-    KNOWN = ("g14", "g16", "g17", "g18", "u16")
+    #:
+    #: The magnitude-limited HNSKY names come first, then ASTAP's current
+    #: density-limited tiers, whose suffix is stars per square degree rather than
+    #: a magnitude (g05 = 500/sq deg). Preference order only matters when two
+    #: databases share a directory, so appending keeps existing setups unchanged
+    #: while letting a directory holding *only* an ASTAP database be found at all
+    #: - without these, a config asking for "g14" over a g05 directory silently
+    #: fell through to the synthetic field.
+    #:
+    #: Listing a prefix costs nothing if it ships in another format: the probe
+    #: globs ``<prefix>_*.290``, so ASTAP's larger ``.1476`` databases simply do
+    #: not match rather than being half-read.
+    KNOWN = (
+        "g14", "g16", "g17", "g18", "u16", "v16", "v17", "tuc",
+        "g05", "v05", "d05", "d20", "d50", "d80", "w08",
+    )  # fmt: skip
 
     def __init__(self, directory: Path | None, prefix: str = "g14") -> None:
         self.directory = Path(directory).expanduser() if directory else None

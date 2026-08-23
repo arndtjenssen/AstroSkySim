@@ -18,6 +18,7 @@ licence header in `src/astroskysim/__init__.py` intact.
 
 ```bash
 uv sync --all-extras --group dev
+uv run astroskysim fetch-catalog                    # ~56 MB .290 database, once
 uv run astroskysim -c examples/sim.toml -v          # -v info, -vv debug
 uv run pytest -q                               # ~20 s, no network needed
 uv run pytest tests/test_end_to_end.py::test_slew_moves_and_settles
@@ -33,10 +34,46 @@ CLI flags override the TOML (`--port`, `--host`, `--mode`, `--survey`, `--catalo
 else is config-only. Note `examples/sim.toml` uses **port 7625**, while the code default and the
 README are 7624.
 
-`catalog/` holds real HNSKY `.290` files, so `artificial` mode works out of the box. Without them a
-synthetic star field is substituted and startup warns — usable for focus, guiding and framing, but
-plate solving against it will fail. `catalog/deep_sky.csv` is present but **no code reads it**: only
-stars are rendered, so there is no nebulosity in `artificial` mode (that is what `composite` is for).
+`catalog/` is **gitignored except its README** — the `.290` files are fetched, not committed. Without
+them a synthetic star field is substituted and startup warns: usable for focus, guiding and framing,
+but plate solving against it will fail. `catalog/deep_sky.csv` is not part of the fetched archive and
+**no code reads it** anyway: only stars are rendered, so there is no nebulosity in `artificial` mode
+(that is what `composite` is for).
+
+`sky/fetch.py` is the download, and the reason it is a mirror rather than a link is load-bearing:
+**g14 is retired upstream.** HNSKY and ASTAP now ship g17/g18/v16/v17/u16 and the d/v/g tiers, 100 MB
+to 1.3 GB, nothing at magnitude 14 — so no upstream URL exists for the database every test fixture
+and every measured number in this file was taken against. The archive is a pre-release asset on this
+repo, pinned by tag and SHA-256; `catalog/README.md` has the publish commands. Two traps the code
+guards, both with tests:
+
+- **The skip check may not go through `StarCatalog`'s prefix fallback.** `StarCatalog(dir, "g14")`
+  resolves through `g14 → g16 → g17 → g18 → u16`, so a directory holding g17 answers yes to "do you
+  have g14" and the download is skipped forever. `_has_cells` globs the exact prefix instead.
+- **A zip member name is hostile data.** Only `*.290` and the acknowledgement are extracted, by
+  basename, so `../../x` cannot escape and HNSKY's nested layout flattens. The acknowledgement ships
+  *inside* the archive because separated from the data the attribution is lost on the first re-upload.
+
+A checksum is never invented: an unpinned entry (`sha256=None`) downloads, warns, and prints the
+digest it got, which is the step that turns a fresh upload into a pinned entry. Zip output is not
+reproducible across tools, so re-zipping the same files needs the digest re-pinned.
+
+**`fetch-catalog g05` is a tested alternative and not an upgrade, and the reason is a naming trap.**
+ASTAP's suffix is *stars per square degree*, not a magnitude: g05 is 20.66M stars capped at ~500/sq°
+locally. The existing decoder reads it with no changes (290 cells, record size 5, epoch 2025, BP
+magnitudes, Gaia to 0.02" rms), so nothing in `catalog.py` needed touching — but it is **not a
+superset of g14**. It reaches BP 18.7 at the galactic pole and only BP 13.4 in Cygnus, where it
+*discards* half the stars g14 has, flattening the sky's real 23:1 density contrast to about 1:1.
+Guide-star selection and plate solve success are exactly what that contrast drives, so g14 stays the
+default; the table is in `README.md`. Every measured number in this file is g14's, and
+`tests/test_catalog.py` hardcodes g14 expectations (`mag.max() == 14.0`, 11,290,236 stars, 7 boundary
+strays), so switching the default would invalidate the fixtures rather than just change the pixels.
+
+`StarCatalog.KNOWN` had to grow ASTAP's density tiers for g05 to be visible at all: with `catalog =
+"g14"` configured, a directory of 290 readable g05 cells resolved to no prefix and the run used the
+*synthetic* field — working software right up until a plate solve. The probe globs
+`<prefix>_*.290`, so listing prefixes that ship in ASTAP's larger `.1476` format is harmless; both
+halves are pinned by tests.
 
 ### Connecting a client
 

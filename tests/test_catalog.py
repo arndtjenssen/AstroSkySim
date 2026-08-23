@@ -228,6 +228,35 @@ def test_prefix_falls_back_to_an_available_database(tmp_path, caplog):
     assert cat.prefix == "g16"
 
 
+def test_an_astap_density_tier_is_found_and_not_mistaken_for_the_synthetic_field(tmp_path):
+    """ASTAP's current names have to be in ``KNOWN`` or they are invisible.
+
+    ``examples/sim.toml`` asks for ``catalog = "g14"``. With the ASTAP tiers
+    missing from the fallback list, a directory holding 290 perfectly readable
+    g05 cells resolved to no prefix at all and the run silently used the
+    synthetic star field - the one failure mode that looks like working software
+    right up until a plate solve.
+    """
+    stars = [(83.6, 22.0, 7.0)]
+    area = area_number(np.deg2rad(83.6), np.deg2rad(22.0))
+    (tmp_path / area_filename(area, "g05")).write_bytes(_encode_290(stars))
+
+    cat = StarCatalog(tmp_path, "g14")
+    assert cat.prefix == "g05"
+    assert len(cat.query(83.6, 22.0, 0.3)) == 1
+    assert not isinstance(build_catalog(tmp_path, "g14"), SyntheticCatalog)
+
+
+def test_a_database_in_the_1476_format_is_not_half_read(tmp_path):
+    """The probe is extension-specific, so listing d50 in KNOWN stays harmless.
+
+    ASTAP's larger databases use 1476 areas and a different extension. Matching
+    one on its prefix alone would hand the .290 decoder a file it cannot read.
+    """
+    (tmp_path / "d50_0101.1476").write_bytes(_encode_290([]))
+    assert StarCatalog(tmp_path, "g14").prefix is None
+
+
 def test_build_catalog_falls_back_to_synthetic(tmp_path):
     cat = build_catalog(tmp_path, "g14", allow_synthetic=True)
     assert isinstance(cat, SyntheticCatalog)

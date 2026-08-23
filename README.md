@@ -13,10 +13,9 @@ one shared rig rather than a GUI application. See
 
 ## Quick start
 
-Download the gaia g14 database here and extract it into the catalog directory.
-
 ```bash
 uv sync --all-extras --group dev
+uv run astroskysim fetch-catalog                  # ~56 MB star database, once
 uv run astroskysim -c examples/sim.toml -v
 ```
 
@@ -27,6 +26,76 @@ Run tests with:
 ```bash
 uv run pytest && uv run ruff check src tests
 ```
+
+## The star catalogue
+
+`artificial` and `composite` render stars from a HNSKY `.290` database, which is
+too large to keep in the repository and is fetched separately:
+
+```bash
+uv run astroskysim fetch-catalog                       # -> ./catalog
+uv run astroskysim -c examples/sim.toml fetch-catalog   # -> source.artificial.catalog_dir
+```
+
+It verifies a pinned SHA-256, unpacks the cells flat into the target directory,
+and does nothing at all if they are already there — so it is safe in a setup
+script. `--force` re-downloads, `-d` picks a directory, `--url`/`--sha256` point
+it at a different archive.
+
+**Without a catalogue the simulator still runs**, on a synthetic star field, and
+warns once at startup. That is usable for focus, guiding and framing, but the
+stars are not at real positions, so **plate solving against it will fail**.
+
+### Why this is a mirror and not a link
+
+The g14 set (GAIA eDR3 to BP 14.0, epoch 2025, 290 cells, 11,290,236 stars) is
+**no longer distributed upstream**. HNSKY's and ASTAP's
+[star database directories](https://sourceforge.net/projects/hnsky/files/star_databases/)
+now carry g17, g18, v16, v17, u16 and the ASTAP d/v/g tiers — everything between
+100 MB and 1.3 GB, with nothing at magnitude 14. So there is no upstream URL to
+link to for g14, and a pinned mirror is the only way `catalog = "g14"` stays
+reproducible.
+
+At 56 MB for 11.3M stars it is also simply the right size for a simulator: deep
+enough that a guide chip has real stars in every field and plate solving works,
+small enough to download without thinking about it.
+
+### g05 is an alternative, not an upgrade
+
+`fetch-catalog g05` pulls
+[ASTAP's current database](https://sourceforge.net/projects/astap-program/files/star_databases/)
+from upstream at 102 MB, 20.66M stars. The existing decoder reads it unchanged —
+same 290-cell layout, same record size 5, same epoch 2025, same BP magnitudes,
+astrometry matching Gaia to 0.02" rms and the Tycho2 bright stars to 0.09".
+
+But **ASTAP's suffix is star density, not magnitude**: g05 means ≤500 stars per
+square degree, applied locally. So it is not a superset of g14. It goes far
+deeper where the sky is empty and *discards stars g14 has* where the sky is full,
+measured over a 0.5° radius field:
+
+| Field | gal. b | g14 ≤BP14 | g05 ≤BP14 | g05 total | g05 limit |
+|---|---:|---:|---:|---:|---:|
+| Cygnus | +5.3° | 1073 | 491 | 491 | BP 13.4 |
+| Sagittarius arm | −0.0° | 705 | 435 | 435 | BP 13.7 |
+| M31 | −21.6° | 288 | 288 | 535 | BP 15.0 |
+| Perseus | −18.0° | 62 | 62 | 413 | BP 18.7 |
+| Coma (gal. pole) | +88.7° | 47 | 47 | 493 | BP 18.2 |
+
+(stars per square degree)
+
+That flattens the sky's real density contrast from 23:1 to about 1:1, which is
+backwards for a simulator: a guide camera in Cygnus *should* be spoilt for choice
+and one at the galactic pole *should* struggle. Guide-star selection and plate
+solve success both depend on that contrast, so g14 stays the default.
+
+g05 is the better choice for one specific job — a wide, sparse, high-latitude
+field where g14 leaves a guide chip with almost nothing. Note that
+`source.artificial.limiting_mag` then interacts with a spatially varying floor:
+`limiting_mag = 16.0` really means 13.4 in Cygnus and 16.0 in Coma.
+
+The mirrored archive includes Han Kleijn's `acknowledgement of databases.txt`,
+which is the attribution the Gaia licence requires and travels with the data
+rather than beside it. See [Acknowledgements](#acknowledgements).
 
 ## Image sources
 
