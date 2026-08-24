@@ -512,5 +512,4 @@ the question rather than arguing it.
 
 The catalogue and survey data described under
 [Acknowledgements](#acknowledgements) are **not** covered by this licence. They
-carry their own terms, some of which are more restrictive than the GPL — notably
-`catalog/deep_sky.csv`, which is licensed for non-commercial use only.
+carry their own terms, some of which are more restrictive than the GPL.

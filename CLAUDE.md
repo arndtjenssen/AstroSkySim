@@ -36,8 +36,7 @@ README are 7624.
 
 `catalog/` is **gitignored except its README** — the `.290` files are fetched, not committed. Without
 them a synthetic star field is substituted and startup warns: usable for focus, guiding and framing,
-but plate solving against it will fail. `catalog/deep_sky.csv` is not part of the fetched archive and
-**no code reads it** anyway: only stars are rendered, so there is no nebulosity in `artificial` mode
+but plate solving against it will fail. only stars are rendered, so there is no nebulosity in `artificial` mode
 (that is what `composite` is for).
 
 `sky/fetch.py` is the download, and the reason it is a mirror rather than a link is load-bearing:
