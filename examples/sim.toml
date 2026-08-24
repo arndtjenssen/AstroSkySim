@@ -104,7 +104,7 @@ elevation_error = 30.0
 
 [source]
 # artificial | dss | composite
-mode = "dss"
+mode = "composite"
 
 [source.artificial]
 # Point this at your HNSKY .290 files; without them a synthetic field is used.
@@ -122,7 +122,9 @@ allow_synthetic_fallback = true
 #   survey = "eso:DSS"
 # Monochrome HiPS only: the ".../color" ones are 8-bit RGBA transcoded from JPEG
 # and are rejected at decode.
-survey = "hips:CDS/P/DSS2/red"
+# survey = "eso:DSS"
+survey = "skyview:DSS"
+# survey = "hips:CDS/P/DSS2/red"
 # Downloads are keyed on the pointing snapped to a grid, so tracking noise does
 # not defeat the cache. ~ is expanded.
 cache_dir = "~/.cache/astroskysim"
