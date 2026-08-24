@@ -34,6 +34,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import warnings
+from collections.abc import Sequence
 from pathlib import Path
 
 import numpy as np
@@ -52,7 +53,27 @@ MIN_IMAGE_BYTES = 4096
 
 ESO_BASE = "https://archive.eso.org/dss/dss"
 
-HIPS_BASE = "https://alasky.cds.unistra.fr/hips-image-services/hips2fits"
+#: hips2fits hosts, tried in order. Two CDS machines serve the same service on
+#: two addresses (``alasky`` 130.79.128.175, ``alaskybis`` 130.79.128.179), and
+#: they fail **independently**: measured 2026-08-24, ``alasky`` accepted the TCP
+#: connection and then never answered - a 2.9 deg DSS2/red cutout, a 0.2 deg one
+#: and the service root with no arguments at all each hung past 120 s - while
+#: ``alaskybis`` returned the identical 3000x3000 request in 10 s. ``alasky`` is
+#: the name in every CDS document, so it is not dropped; it is second because a
+#: dead first host costs a probe timeout per cutout and this is the one we have
+#: evidence about. Order is a snapshot, not a ranking - override with
+#: ``[source.dss] hips_bases``.
+HIPS_BASES = (
+    "https://alaskybis.cds.unistra.fr/hips-image-services/hips2fits",
+    "https://alasky.cds.unistra.fr/hips-image-services/hips2fits"
+)
+
+#: Socket timeout for a host that has an alternate behind it. This is not a
+#: budget for the whole transfer: ``urlopen``'s timeout applies per socket
+#: operation, so a slow-but-streaming 18 MB download never trips it and only a
+#: genuine stall does. That is what makes a short value safe here - the failure
+#: mode being probed for is silence, not slowness.
+HIPS_PROBE_TIMEOUT_S = 15.0
 
 #: Short names for the HiPS worth pointing a simulator at. Anything containing a
 #: "/" is taken as a full HiPS id and passed through, so the whole CDS list stays
@@ -196,6 +217,116 @@ def resolve_skyview_survey(survey: str) -> str:
     return SKYVIEW_ALIASES.get(key, survey)
 
 
+def hips_error_text(exc: urllib.error.HTTPError) -> str:
+    """Unwrap the service's JSON error body, which names the actual problem.
+
+    An unknown id answers 400 with
+    ``{"title": "Unknown HiPS", "description": "Could not find a HiPS ..."}``,
+    which is far more use than the bare status line.
+    """
+    try:
+        body = exc.read().decode("utf-8", errors="replace")
+    except Exception:
+        return f"HTTP {exc.code}"
+    with contextlib.suppress(Exception):
+        parsed = json.loads(body)
+        if isinstance(parsed, dict):
+            detail = parsed.get("description") or parsed.get("title")
+            if detail:
+                return f"HTTP {exc.code}: {detail}"
+    return f"HTTP {exc.code}: {body[:200].strip()}"
+
+
+def _blames_the_request(exc: urllib.error.HTTPError) -> bool:
+    """Is this status the request's fault rather than the host's?
+
+    A 400 "Unknown HiPS" is the same 400 on every mirror, so failing over would
+    burn a full timeout per host and then report the *last* one's message. 408
+    and 429 are excluded: both are about this host right now, and another one may
+    well answer.
+    """
+    return 400 <= exc.code < 500 and exc.code not in (408, 429)
+
+
+class HipsEndpoint:
+    """Picks a live hips2fits host and remembers it.
+
+    One instance is shared by every survey layer (``sources/registry.py``),
+    which is the point: with a layer per filter, a per-layer endpoint would
+    rediscover a dead host once per filter instead of once per process.
+
+    Failover is warranted because the two CDS hosts fail independently - see
+    ``HIPS_BASES``. Two rules keep it from being worse than no failover at all:
+    a host with an alternate behind it gets ``probe_timeout_s`` rather than the
+    full ``timeout_s``, and a request-shaped error (an unknown HiPS id) is
+    raised immediately instead of being retried against hosts that will all
+    answer the same way.
+    """
+
+    def __init__(
+        self,
+        bases: Sequence[str] | None = None,
+        probe_timeout_s: float = HIPS_PROBE_TIMEOUT_S,
+    ) -> None:
+        # ``None`` means "use the built-in chain"; an explicitly empty list is a
+        # config mistake, and silently substituting the default would hide it.
+        self.bases = HIPS_BASES if bases is None else tuple(bases)
+        if not self.bases:
+            raise ValueError("hips_bases is empty: no hips2fits host to fetch from")
+        self.probe_timeout_s = probe_timeout_s
+        #: The host that last worked, tried first from then on. Cleared when it
+        #: fails, so a host that dies mid-run does not pin the run to itself.
+        self.pinned: str | None = None
+
+    def _order(self) -> tuple[str, ...]:
+        if self.pinned is None or self.pinned not in self.bases:
+            return self.bases
+        return (self.pinned, *(b for b in self.bases if b != self.pinned))
+
+    def get(self, query: str, timeout_s: float) -> bytes:
+        """The response body for ``query``, from the first host that answers."""
+        order = self._order()
+        failures: list[str] = []
+        for i, base in enumerate(order):
+            last = i == len(order) - 1
+            budget = timeout_s if last else min(timeout_s, self.probe_timeout_s)
+            try:
+                raw = self._get_one(f"{base}?{query}", budget)
+            except urllib.error.HTTPError as exc:
+                detail = hips_error_text(exc)
+                if _blames_the_request(exc):
+                    raise SourceError(f"hips2fits rejected the request: {detail}") from exc
+                failures.append(f"{_host(base)}: {detail}")
+            except Exception as exc:
+                failures.append(f"{_host(base)}: {exc}")
+            else:
+                if self.pinned != base:
+                    log.info("hips2fits host %s answered; using it from now on", _host(base))
+                    self.pinned = base
+                return raw
+            if not last:
+                log.warning("hips2fits %s, trying the next host", failures[-1])
+        self.pinned = None
+        raise SourceError("hips2fits fetch failed - " + "; ".join(failures))
+
+    @staticmethod
+    def _get_one(url: str, timeout_s: float) -> bytes:
+        with urllib.request.urlopen(url, timeout=timeout_s) as resp:  # noqa: S310 - https only
+            raw = resp.read()
+        if len(raw) < MIN_IMAGE_BYTES:
+            # A short body is an error page. It may be this host's gateway
+            # rather than the request, so it counts as a host failure and the
+            # text goes into the summary either way.
+            msg = raw[:256].decode("utf-8", errors="replace").strip()
+            raise SourceError(f"returned {len(raw)} bytes, not an image: {msg}")
+        return raw
+
+
+def _host(base: str) -> str:
+    """Just the hostname, so a log line is readable."""
+    return urllib.parse.urlparse(base).netloc or base
+
+
 class DssSource:
     """Fetch a survey cutout and resample it onto the sensor pixel grid."""
 
@@ -232,8 +363,12 @@ class DssSource:
         #: whatever is requested, so this is politeness towards a free service as
         #: much as a memory bound.
         max_download_px: int = 3000,
+        #: Shared hips2fits host picker. Pass the *same* instance to every layer
+        #: so a dead host is discovered once per process, not once per filter.
+        hips: HipsEndpoint | None = None,
     ) -> None:
         self.survey = survey
+        self.hips = hips or HipsEndpoint()
         self.cache_dir = Path(cache_dir).expanduser() if cache_dir else None
         if self.cache_dir:
             self.cache_dir.mkdir(parents=True, exist_ok=True)
@@ -330,6 +465,8 @@ class DssSource:
         No ``rotation_angle``: the cutout is fetched north-up and rotated locally
         by ``_reproject``. Baking the rotator angle into the request would make
         every rotator position a separate download and a separate cache entry.
+
+        Which host serves it is ``HipsEndpoint``'s problem, not this method's.
         """
         hips_id = resolve_hips_id(survey)
         query = urllib.parse.urlencode(
@@ -348,44 +485,12 @@ class DssSource:
                 "format": "fits",
             }
         )
-        url = f"{HIPS_BASE}?{query}"
         try:
-            with urllib.request.urlopen(url, timeout=self.timeout_s) as resp:
-                raw = resp.read()
-        except urllib.error.HTTPError as exc:
-            raise SourceError(
-                f"hips2fits rejected {hips_id!r}: {self._hips_error(exc)}"
-            ) from exc
-        except Exception as exc:
-            raise SourceError(f"hips2fits fetch failed for {hips_id!r}: {exc}") from exc
-
-        if len(raw) < MIN_IMAGE_BYTES:
-            msg = raw[:256].decode("utf-8", errors="replace").strip()
-            raise SourceError(
-                f"hips2fits returned {len(raw)} bytes for {hips_id!r}, "
-                f"not an image: {msg}"
-            )
-        return raw
-
-    @staticmethod
-    def _hips_error(exc: urllib.error.HTTPError) -> str:
-        """Unwrap the service's JSON error body, which names the actual problem.
-
-        An unknown id answers 400 with
-        ``{"title": "Unknown HiPS", "description": "Could not find a HiPS ..."}``,
-        which is far more use than the bare status line.
-        """
-        try:
-            body = exc.read().decode("utf-8", errors="replace")
-        except Exception:
-            return f"HTTP {exc.code}"
-        with contextlib.suppress(Exception):
-            parsed = json.loads(body)
-            if isinstance(parsed, dict):
-                detail = parsed.get("description") or parsed.get("title")
-                if detail:
-                    return f"HTTP {exc.code}: {detail}"
-        return f"HTTP {exc.code}: {body[:200].strip()}"
+            return self.hips.get(query, self.timeout_s)
+        except SourceError as exc:
+            # The endpoint reports hosts and statuses; the id is this layer's
+            # contribution to the diagnosis and is not in scope down there.
+            raise SourceError(f"{exc} (hips {hips_id!r})") from exc
 
     def _fetch_skyview(
         self, ra: float, dec: float, size_deg: float, survey: str, shape: tuple[int, int]

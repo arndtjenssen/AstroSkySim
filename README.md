@@ -16,6 +16,7 @@ one shared rig rather than a GUI application. See
 ```bash
 uv sync --all-extras --group dev
 uv run astroskysim fetch-catalog                  # ~56 MB star database, once
+uv run astroskysim fetch-satellites               # orbital elements, occasionally
 uv run astroskysim -c examples/sim.toml -v
 ```
 
@@ -150,6 +151,26 @@ black hole exactly where the target is, so `source.dss.min_coverage` (default
 over M42 is the worked example: the whole core is masked out. Smaller gaps are
 filled as empty sky and warned about once.
 
+**Two hips2fits hosts, tried in order.** CDS serves the same service from
+`alaskybis.cds.unistra.fr` and `alasky.cds.unistra.fr`, and they fail
+independently: With one host that is the whole survey path down for
+however long the outage lasts, so `source.dss.hips_bases` is a failover chain and
+the first host that answers is remembered for the rest of the process.
+
+Two details keep the failover from costing more than it saves. A host that still
+has an alternate behind it gets `source.dss.hips_probe_timeout_s` (15 s) rather
+than the full `timeout_s`, which is safe because `urlopen`'s timeout applies per
+socket operation — a slow-but-streaming 18 MB download never trips it and only a
+genuine stall does. And a 4xx is raised immediately instead of being retried:
+an unknown HiPS id is the same 400 on every mirror, so failing over would burn a
+timeout per host and then report the wrong host's message.
+
+```toml
+[source.dss]
+hips_bases = ["https://alasky.cds.unistra.fr/hips-image-services/hips2fits"]
+hips_probe_timeout_s = 15.0
+```
+
 hips2fits resamples onto whatever pixel grid it is asked for, so the request is
 sized to the sensor's own plate scale across the downloaded footprint, clamped to
 `[300, source.dss.max_download_px]`. The cutout is fetched north-up and rotated
@@ -220,6 +241,110 @@ its own plate scale, and `FOCALLEN`/`APTDIA`/`HFD` in the FITS header describe
 the train that camera actually looks through — a plate solver takes `FOCALLEN` as
 its scale hint, so the main scope's value in a guide frame sends it hunting at
 the wrong field size.
+
+## Satellite trails
+
+A long sub taken in the 2020s has satellites in it. AstroSkySim propagates real
+orbital elements and draws the trails, so a client's rejection stack, its trail
+detector, or a human looking at a sub has something real to work on.
+
+```bash
+uv run astroskysim fetch-satellites          # download the elements
+uv run astroskysim fetch-satellites --list   # what is enabled, and how old it is
+```
+
+### The configuration is shared, not per rig
+
+Which satellites are in orbit is a property of the machine and of the week, not
+of a telescope. So the source list, the element cache and the photometry live in
+their **own file**, found by search rather than named by each rig config:
+
+1. `--satellites FILE`
+2. `[satellites] config = "..."` in the rig config
+3. `./satellites.toml`
+4. `~/.config/astroskysim/satellites.toml`
+
+One `fetch-satellites` then serves every `sim.toml` on the box. If no file is
+found the built-in defaults apply, identical to the shipped template, so the
+feature behaves the same with and without one. `fetch-satellites` writes the
+template on first use — that is the copy to edit. `examples/satellites.toml` is
+the same file, generated from the same defaults.
+
+A rig config carries only a pointer and an off switch:
+
+```toml
+[satellites]
+# config = "~/observatory/satellites.toml"
+# enabled = false      # no trails for this rig
+```
+
+There is deliberately no `enabled = true` in a rig config. With nothing fetched
+there is nothing to switch on, and "does this machine have satellites" is the
+shared file's decision.
+
+### Sources
+
+[Celestrak](https://celestrak.org/NORAD/elements/) groups. Any URL serving
+two-line elements works, not only Celestrak.
+
+Downloads are idempotent: a list fetched within `refetch_after_hours` is left
+alone, and **Celestrak answers "you already have the current data" with HTTP
+403**, not 304. Read as a status code that is indistinguishable from a rate
+limit, so the body decides — otherwise the message sends you off to wait out a
+throttle that does not exist.
+
+### Photometry
+
+`std_mag` is per source list: the visual magnitude the satellite would have at
+1000 km range and a 90° phase angle. Everything else follows from the geometry
+and from the optics already in play — inverse square in range, a diffuse-sphere
+phase function, then the same `magnitude_to_electrons` the stars go through. So
+a trail dims through a narrowband filter, brightens with aperture and moves with
+the zero point, together with everything else in the frame.
+
+Two consequences worth knowing:
+
+- **A trail's brightness is flux per dwell time, not flux per frame.** A pixel
+  collects light only while the satellite is on it, so the level along a trail
+  is the same in a 30 s sub and a 300 s one — the trail is just longer. That is
+  why an ISS pass saturates and a Starlink pass at 1.1 °/s does not, from the
+  same photometry.
+- **A geostationary satellite still trails.** It sits still over the ground and
+  therefore drifts at the sidereal rate against the stars, drawing a short
+  bright trail in a long sub rather than a long faint one. Nothing special
+  handles this; it falls out.
+
+One number per list is coarse — real per-object standard magnitudes need a
+magnitude database, which no Celestrak TLE carries — but it does put an ISS pass
+and a Starlink pass four hundred times apart in brightness, which is the ordering
+that matters.
+
+### What the frame gets
+
+Satellites reach **light frames only**: a trail in a master dark is a defect a
+client cannot distinguish from a real one. The count of trails that reached the
+sensor is written to the FITS header as `NSATS`, which is the only way a
+rejection stack can check itself against ground truth.
+
+The trail is convolved with the same PSF the stars get, so a trail through a
+defocused frame is a defocused trail, and it is added *after* the composite
+source's point-source suppression, which would otherwise erase it.
+
+### Cost
+
+Propagating every object at the sampling a sub-pixel trail needs would be
+millions of SGP4 calls per frame, so the search is coarse and only the few
+satellites that come near the field are propagated finely, over only the seconds
+they are near it. Measured: **0.6 s** for a 300 s sub on a 3008² sensor against
+12000 objects, in the readout thread, against ~3 s for a survey reprojection on
+the same frame. A 2 s guide frame costs ~0.06 s. It scales with exposure, so an
+hour-long sub against the same sky is several seconds — still off the event
+loop, and still less than the frame it is drawn on.
+
+The search cone is `2.5 °/s × coarse_step_s` wide and is derived rather than
+configured, because a LEO satellite can cross the whole field between two coarse
+samples: the step and the cone are one decision, and splitting them is how a
+coarser search silently loses trails.
 
 ## Devices
 
@@ -446,6 +571,19 @@ background, and the database builder was right to drop them.
   `mode = "composite"` to get catalogue stars instead. It covers ~65% of the
   sky; below its footprint the fetch fails and `fallback_to_artificial` serves a
   star field with no nebulosity.
+- **Satellite magnitudes are one number per source list.** Real per-object
+  standard magnitudes need a magnitude database (Mike McCants' `qs.mag`), which
+  no Celestrak TLE carries. The values shipped are estimates from published
+  observing campaigns, not measurements made here; they are an ordering, not
+  photometry. Nothing models tumbling, flares, or the brightness difference
+  between a Starlink v1.5 and a v2 mini.
+- **The Earth's shadow is a cylinder.** The real one is a cone with a penumbra a
+  few hundred km deep, so a satellite entering eclipse fades over a second or
+  two where this cuts sharply. The useful behaviour — a trail that stops
+  mid-frame — is there either way.
+- **Satellite positions are TEME treated as equinox of date.** The two differ by
+  the equation of the equinoxes, up to ~1.1″, which is three orders of magnitude
+  below the arcminute-scale error a TLE a few days old already carries.
 - **Luminance has no survey.** DSS2 red is the stand-in in `examples/sim.toml`:
   all-sky, sharp, and its passband contains Ha so emission nebulae actually
   show. It is an R-band image wearing an L label, one magnitude brighter.
@@ -461,6 +599,9 @@ src/astroskysim/
   sky/       catalog.py     .290 reader, area indexing, synthetic fallback
              render.py      PSF, defocus hyperbola, noise, bayer, binning
              wcs.py         sensor WCS, closed-form LST/altaz, precession
+  satellites/ config.py     the shared source list, found by search
+             tle.py         Celestrak groups, download, element parsing
+             trails.py      SGP4, illumination, the swept PSF
   sources/   artificial | dss | composite, behind one interface
   rig.py     all physical state and the simulation step
   devices/   mount, camera, focuser, rotator, filterwheel

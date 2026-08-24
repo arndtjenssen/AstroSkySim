@@ -27,6 +27,11 @@ dss = [
     "reproject>=0.13",
     "astroquery>=0.4.7",
 ]
+# Satellite trails. Optional for the same reason as `dss`: without it the
+# simulator runs, logs that the extra is missing, and draws no trails.
+satellites = [
+    "sgp4>=2.23",
+]
 
 [project.scripts]
 astroskysim = "astroskysim.cli:main"

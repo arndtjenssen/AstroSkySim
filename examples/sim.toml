@@ -11,7 +11,9 @@ longitude = 8.86
 elevation = 300.0
 
 [telescope]
+# match the focal length with your scope including a reducer
 focal_length_mm = 432.0
+# the aperture of your scope
 aperture_mm = 90.0
 # Off-axis guider: the guide camera looks through the OTA above, so it inherits
 # both values and TELESCOPE_INFO reports them as GUIDER_APERTURE /
@@ -101,6 +103,15 @@ periodic_error_period = 480.0
 tracking_noise = 0.5              # arcsec RMS
 azimuth_error = 20.0               # arcmin of polar misalignment
 elevation_error = 30.0
+
+# Satellite trails. Everything about them - which lists are in the sky, how
+# bright they are, where the elements are cached - lives in its own file, found
+# at ./satellites.toml or ~/.config/astroskysim/satellites.toml, so one
+# `astroskysim fetch-satellites` serves every rig config on the machine. See
+# examples/satellites.toml. Without a download there are simply no trails.
+[satellites]
+# config = "~/observatory/satellites.toml"   # override the search
+# enabled = false                            # off for this rig only
 
 [source]
 # artificial | dss | composite

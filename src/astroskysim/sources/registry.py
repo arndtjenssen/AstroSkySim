@@ -9,19 +9,20 @@ from ..sky.catalog import build_catalog
 from .artificial import ArtificialSource
 from .base import ImageSource
 from .composite import CompositeSource
-from .dss import DssSource, FallbackSource
+from .dss import DssSource, FallbackSource, HipsEndpoint
 from .filtered import FilterSurveySource
 
 log = logging.getLogger("astroskysim.sources")
 
 
-def _build_layer(layer: SurveyLayer, cfg: Config) -> DssSource:
+def _build_layer(layer: SurveyLayer, cfg: Config, hips: HipsEndpoint) -> DssSource:
     """One survey, with the transport settings shared by every layer."""
     dss = cfg.source.dss
     return DssSource(
         survey=layer.survey,
         cache_dir=dss.cache_dir,
         timeout_s=dss.timeout_s,
+        hips=hips,
         min_coverage=dss.min_coverage,
         max_download_px=dss.max_download_px,
         ref_mag_arcsec2=layer.ref_mag_arcsec2,
@@ -33,7 +34,12 @@ def _build_layer(layer: SurveyLayer, cfg: Config) -> DssSource:
 
 def _build_survey(cfg: Config) -> ImageSource:
     """The default survey, or a per-filter dispatcher over several."""
-    default = _build_layer(cfg.source.dss.default_layer, cfg)
+    # One endpoint for every layer: which CDS host is alive is a property of the
+    # network, not of a filter, so discovering it once per process is the point.
+    hips = HipsEndpoint(
+        cfg.source.dss.hips_bases, cfg.source.dss.hips_probe_timeout_s
+    )
+    default = _build_layer(cfg.source.dss.default_layer, cfg, hips)
     per_filter = cfg.source.dss.per_filter
     if not per_filter:
         return default
@@ -52,7 +58,7 @@ def _build_survey(cfg: Config) -> ImageSource:
             "" if layer.in_band else ", attenuated by the filter",
         )
     return FilterSurveySource(
-        default, {n: _build_layer(layer, cfg) for n, layer in per_filter.items()}
+        default, {n: _build_layer(layer, cfg, hips) for n, layer in per_filter.items()}
     )
 
 

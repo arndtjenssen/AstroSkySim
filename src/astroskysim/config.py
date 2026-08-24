@@ -241,6 +241,14 @@ class DssSource(BaseModel):
     survey: str = "hips:CDS/P/DSS2/red"
     cache_dir: UserPath | None = None
     timeout_s: float = Field(60.0, gt=0)
+    #: hips2fits hosts, tried in order; unset uses ``dss.HIPS_BASES``. The two
+    #: CDS machines fail independently - one has answered the TCP connection and
+    #: then gone silent for minutes while the other served the same cutout - so
+    #: the list is a failover chain, not a preference.
+    hips_bases: list[str] | None = None
+    #: Socket timeout for a host that still has an alternate behind it, so a
+    #: silent host costs this rather than the full ``timeout_s``.
+    hips_probe_timeout_s: float = Field(15.0, gt=0)
     #: Fall back to the artificial sky if the fetch fails, rather than erroring.
     fallback_to_artificial: bool = True
     #: Refuse a cutout covering less than this fraction of the sensor. Partial-sky
@@ -294,6 +302,26 @@ class SourceConfig(BaseModel):
     composite: CompositeSource = Field(default_factory=CompositeSource)
 
 
+class SatellitesRef(BaseModel):
+    """A rig config's pointer to the *shared* satellite configuration.
+
+    The source list, the element cache and the photometry live in their own
+    file (``satellites/config.py``), because which satellites are in orbit is a
+    property of the machine and the week rather than of a telescope: one
+    download and one list serve every ``sim.toml`` on the box. All a rig config
+    gets is where to look and whether to look at all.
+
+    ``enabled = false`` switches trails off for this rig. There is no
+    ``enabled = true``: with nothing fetched there is nothing to switch on, and
+    "does this machine have satellites" is the shared file's decision.
+    """
+
+    #: Overrides the search path. A path that does not exist is an error, not a
+    #: fall-through to the defaults.
+    config: UserPath | None = None
+    enabled: bool | None = None
+
+
 class ServerConfig(BaseModel):
     host: str = "0.0.0.0"
     port: int = Field(7624, ge=1, le=65535)
@@ -324,6 +352,9 @@ class Config(BaseModel):
     mount: MountConfig = Field(default_factory=MountConfig)
     optics: Optics = Field(default_factory=Optics)
     source: SourceConfig = Field(default_factory=SourceConfig)
+    #: Where the shared satellite configuration lives, and whether to use it.
+    #: Everything else about satellites is in that file, not this one.
+    satellites: SatellitesRef = Field(default_factory=SatellitesRef)
     #: Fixed RNG seed makes a run reproducible; None seeds from the OS.
     seed: int | None = 1234
 

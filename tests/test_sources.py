@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import io
 import math
+import urllib.error
 import urllib.parse
 
 import numpy as np
@@ -31,8 +32,10 @@ from astroskysim.sources.composite import CompositeSource, suppress_point_source
 from astroskysim.sources.dss import (
     CACHE_CELL_FRACTION,
     HIPS_ALIASES,
+    HIPS_BASES,
     DssSource,
     FallbackSource,
+    HipsEndpoint,
     resolve_hips_id,
     resolve_skyview_survey,
 )
@@ -368,6 +371,179 @@ def test_hips_error_body_is_surfaced(monkeypatch):
     src = DssSource(survey="hips:CDS/P/NOPE")
     with pytest.raises(SourceError, match="Could not find a HiPS"):
         src.fetch(make_ctx())
+
+
+# --------------------------------------------------------------------------
+# hips2fits host failover
+# --------------------------------------------------------------------------
+def fake_hosts(monkeypatch, behaviour: dict[str, object]) -> list[tuple[str, float]]:
+    """Stub urlopen per hostname. Returns the (host, timeout) log of attempts.
+
+    ``behaviour`` maps a hostname to what that host does: an exception instance
+    to raise, or anything else to answer with a valid cutout.
+    """
+    calls: list[tuple[str, float]] = []
+
+    class FakeResp:
+        def read(self):
+            return survey_fits()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    def fake_urlopen(url, *a, timeout=None, **k):
+        host = urllib.parse.urlparse(url).netloc
+        calls.append((host, timeout))
+        outcome = behaviour.get(host, "ok")
+        if isinstance(outcome, Exception):
+            raise outcome
+        return FakeResp()
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    return calls
+
+
+A, B = "a.example", "b.example"
+TWO_HOSTS = (f"https://{A}/hips2fits", f"https://{B}/hips2fits")
+
+
+def make_hips_source(**kw) -> DssSource:
+    return DssSource(
+        survey="hips:CDS/P/DSS2/red",
+        hips=HipsEndpoint(TWO_HOSTS, probe_timeout_s=3.0),
+        **kw,
+    )
+
+
+def test_default_hips_hosts_are_a_failover_chain():
+    """Both CDS machines are listed: measured 2026-08-24, alasky accepted the
+    connection and never answered while alaskybis served the same cutout in 10 s.
+    One host means that outage is the whole survey path down."""
+    assert len(HIPS_BASES) >= 2
+    assert len({urllib.parse.urlparse(b).netloc for b in HIPS_BASES}) == len(HIPS_BASES)
+
+
+def test_a_silent_host_fails_over_to_the_next(monkeypatch):
+    src = make_hips_source()
+    calls = fake_hosts(monkeypatch, {A: TimeoutError("The read operation timed out")})
+    data, _ = src.fetch(make_ctx())
+    assert [h for h, _ in calls] == [A, B]
+    assert data.size > 0
+
+
+def test_a_host_with_an_alternate_behind_it_gets_the_probe_timeout(monkeypatch):
+    """A dead first host must not cost the full timeout_s per cutout - that is
+    the 60 s stall this failover exists to remove. The last host still gets the
+    full budget, because there is nothing left to fall back to."""
+    src = make_hips_source(timeout_s=60.0)
+    calls = fake_hosts(monkeypatch, {A: TimeoutError("timed out")})
+    src.fetch(make_ctx())
+    assert dict(calls) == {A: 3.0, B: 60.0}
+
+
+def test_the_working_host_is_remembered(monkeypatch):
+    """Rediscovering the dead host on every exposure would reintroduce the stall
+    this removes, once per frame."""
+    src = make_hips_source()
+    calls = fake_hosts(monkeypatch, {A: TimeoutError("timed out")})
+    src.fetch(make_ctx())
+    src._mem.clear()
+    src.fetch(make_ctx(ra=120.0, dec=10.0))
+    assert [h for h, _ in calls] == [A, B, B], "the dead host was probed twice"
+
+
+def test_the_pin_is_dropped_when_that_host_dies(monkeypatch):
+    """Sticky must not mean stuck: the host that worked an hour ago is exactly
+    the one that goes silent mid-session."""
+    src = make_hips_source()
+    fake_hosts(monkeypatch, {A: TimeoutError("timed out")})
+    src.fetch(make_ctx())
+    assert B in src.hips.pinned
+
+    src._mem.clear()
+    calls = fake_hosts(monkeypatch, {B: TimeoutError("timed out")})
+    src.fetch(make_ctx(ra=200.0, dec=-5.0))
+    assert [h for h, _ in calls] == [B, A]
+    assert A in src.hips.pinned
+
+
+def test_a_layer_shares_one_endpoint_with_every_other_layer(monkeypatch):
+    """A DssSource per filter times out against the dead host once per filter
+    unless they share the picker."""
+    cfg = Config.model_validate(
+        {
+            "source": {
+                "mode": "dss",
+                "dss": {
+                    "survey": "hips:dss2r",
+                    "fallback_to_artificial": False,
+                    "hips_bases": list(TWO_HOSTS),
+                    "hips_probe_timeout_s": 3.0,
+                    "per_filter": {
+                        "Ha": {"survey": "hips:ha"},
+                        "OIII": {"survey": "hips:oiii"},
+                    },
+                },
+            },
+            "filter_wheel": {"names": ["Ha", "OIII"], "focus_offsets": [120, 120]},
+        }
+    )
+    src = build_source(cfg)
+    endpoints = {id(src.default.hips), *(id(la.hips) for la in src.per_filter.values())}
+    assert len(endpoints) == 1
+
+
+def test_an_unknown_hips_id_is_not_retried_against_every_host(monkeypatch):
+    """A 400 is the same 400 on every mirror. Failing over would burn a timeout
+    per host and then report the last one's message instead of the real one."""
+    src = make_hips_source()
+    calls = fake_hosts(
+        monkeypatch,
+        {
+            A: urllib.error.HTTPError(
+                "u", 400, "Bad Request", {},  # type: ignore[arg-type]
+                io.BytesIO(b'{"description": "Could not find a HiPS"}'),
+            )
+        },
+    )
+    with pytest.raises(SourceError, match="Could not find a HiPS"):
+        src.fetch(make_ctx())
+    assert [h for h, _ in calls] == [A], "a bad id was retried against the mirror"
+
+
+def test_a_server_error_does_fail_over(monkeypatch):
+    """5xx is the host's problem, unlike 4xx."""
+    src = make_hips_source()
+    calls = fake_hosts(
+        monkeypatch,
+        {A: urllib.error.HTTPError("u", 502, "Bad Gateway", {}, io.BytesIO(b""))},  # type: ignore[arg-type]
+    )
+    src.fetch(make_ctx())
+    assert [h for h, _ in calls] == [A, B]
+
+
+def test_all_hosts_down_names_every_one_of_them(monkeypatch):
+    """The whole point of the log line: which hosts were tried and what each
+    said, so the next step is obvious."""
+    src = make_hips_source()
+    fake_hosts(
+        monkeypatch,
+        {A: TimeoutError("timed out"), B: OSError("connection refused")},
+    )
+    with pytest.raises(SourceError) as exc:
+        src.fetch(make_ctx())
+    msg = str(exc.value)
+    assert A in msg and B in msg
+    assert "timed out" in msg and "connection refused" in msg
+    assert "CDS/P/DSS2/red" in msg, "the failing survey id is not in the error"
+
+
+def test_an_empty_host_list_is_rejected():
+    with pytest.raises(ValueError, match="no hips2fits host"):
+        HipsEndpoint([])
 
 
 def test_hips_reprojects_onto_the_sensor_grid(monkeypatch):

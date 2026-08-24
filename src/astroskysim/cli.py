@@ -7,6 +7,7 @@ import asyncio
 import contextlib
 import logging
 import sys
+import time
 from pathlib import Path
 
 from .config import Config, SourceMode
@@ -17,6 +18,13 @@ from .devices.mount import Mount
 from .devices.rotator import Rotator
 from .indi.server import IndiServer
 from .rig import build_rig
+from .satellites.config import (
+    DEFAULT_CONFIG_PATH,
+    SatellitesConfig,
+    discover_config,
+    write_default_config,
+)
+from .satellites.tle import fetch_sources, parse_tle_text, tle_path
 from .sky.fetch import DEFAULT_RELEASE, RELEASES, fetch_catalog, resolve_release
 
 log = logging.getLogger("astroskysim")
@@ -61,6 +69,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "hips:ha, hips:CDS/P/PanSTARRS/DR1/r), 'skyview:DSS2 Red' or eso:DSS",
     )
     p.add_argument("--catalog-dir", type=Path, help="directory holding the .290 star database")
+    p.add_argument(
+        "--satellites",
+        type=Path,
+        metavar="FILE",
+        help="shared satellite config (default: ./satellites.toml, then "
+        f"{DEFAULT_CONFIG_PATH})",
+    )
     p.add_argument("-v", "--verbose", action="count", default=0, help="-v info, -vv debug")
 
     # Optional subcommand: a bare `astroskysim -c sim.toml` still runs the server,
@@ -94,9 +109,37 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     # its -v. None means "not given here" and main() falls back.
     f.add_argument("-v", "--verbose", action="count", default=None, dest="sub_verbose")
 
+    s = sub.add_parser(
+        "fetch-satellites",
+        help="download orbital elements for the enabled satellite sources",
+        description="Download two-line element sets from Celestrak into the shared "
+        "element cache. Idempotent: a source fetched within refetch_after_hours is "
+        "left alone. Writes a default satellite config if none is found yet.",
+    )
+    s.add_argument(
+        "--force", action="store_true", help="re-download even if the cached elements are fresh"
+    )
+    s.add_argument(
+        "--all",
+        action="store_true",
+        help="fetch every source in the config, not just the enabled ones",
+    )
+    s.add_argument(
+        "-l", "--list", action="store_true", dest="list_sources",
+        help="show the sources and the age of their elements, and download nothing",
+    )
+    s.add_argument("--timeout", type=float, metavar="S", help="download timeout per source")
+    # Accepted on both sides of the subcommand, because typing it after the verb
+    # is the obvious thing to do. Same dest trick as -v: a subparser default
+    # overwrites the main parser's value, so it needs its own.
+    s.add_argument("--satellites", type=Path, dest="sub_satellites", default=None, metavar="FILE")
+    s.add_argument("-v", "--verbose", action="count", default=None, dest="sub_verbose")
+
     args = p.parse_args(argv)
     if getattr(args, "sub_verbose", None):
         args.verbose = args.sub_verbose
+    if getattr(args, "sub_satellites", None):
+        args.satellites = args.sub_satellites
     return args
 
 
@@ -112,6 +155,8 @@ def load_config(args: argparse.Namespace) -> Config:
         cfg.source.dss.survey = args.survey
     if args.catalog_dir:
         cfg.source.artificial.catalog_dir = args.catalog_dir
+    if args.satellites:
+        cfg.satellites.config = args.satellites
     return cfg
 
 
@@ -141,6 +186,65 @@ def cmd_fetch_catalog(args: argparse.Namespace) -> int:
     return 0
 
 
+def _satellites_config(args: argparse.Namespace) -> tuple[SatellitesConfig, Path | None]:
+    """The shared satellite config the CLI should act on, and where it came from.
+
+    ``-c`` is honoured so ``fetch-satellites -c sim.toml`` downloads into the
+    directory that run will read from, the same way ``fetch-catalog`` does.
+    """
+    ref = None
+    if args.config and args.satellites is None:
+        ref = Config.load(args.config).satellites
+    path = discover_config(args.satellites or (ref.config if ref else None))
+    cfg = SatellitesConfig.load(path) if path else SatellitesConfig()
+    return cfg, path
+
+
+def cmd_fetch_satellites(args: argparse.Namespace) -> int:
+    """``astroskysim fetch-satellites`` — populate the element cache."""
+    try:
+        cfg, path = _satellites_config(args)
+    except (FileNotFoundError, ValueError) as exc:
+        print(f"astroskysim: {exc}", file=sys.stderr)
+        return 2
+
+    if path is None and not args.list_sources:
+        # Give the user the menu to edit. Never overwrites: write_default_config
+        # returns an existing file untouched.
+        path = write_default_config()
+        cfg = SatellitesConfig.load(path)
+    print(f"satellite config: {path or 'built-in defaults'}", file=sys.stderr)
+
+    if args.timeout:
+        cfg = cfg.model_copy(update={"timeout_s": args.timeout})
+
+    if args.list_sources:
+        for src in cfg.sources:
+            cached = tle_path(src, cfg.tle_dir)
+            if cached.is_file():
+                age_d = (time.time() - cached.stat().st_mtime) / 86400.0
+                n = len(parse_tle_text(cached.read_text(errors="replace")))
+                state = f"{n:6d} objects, {age_d:.1f} d old"
+            else:
+                state = "not fetched"
+            print(f"  [{'x' if src.enabled else ' '}] {src.key:<22} {state}")
+        return 0
+
+    results = fetch_sources(cfg, force=args.force, sources=cfg.sources if args.all else None)
+    failed = [r for r in results if r.status == "failed"]
+    for r in failed:
+        print(f"astroskysim: {r.source}: {r.detail}", file=sys.stderr)
+    total = sum(r.count for r in results)
+    print(
+        f"{total} objects across {len(results) - len(failed)} of {len(results)} sources "
+        f"in {cfg.tle_dir}",
+        file=sys.stderr,
+    )
+    # A partial failure still leaves a usable sky, so it is not an error exit
+    # unless nothing at all came back.
+    return 1 if results and len(failed) == len(results) else 0
+
+
 async def run(cfg: Config) -> None:
     server = build_server(cfg)
     try:
@@ -153,9 +257,13 @@ async def run(cfg: Config) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
-    # A 56 MB download that prints nothing looks like a hang, so fetch-catalog
-    # starts at info rather than warning.
-    verbosity = max(args.verbose, 1) if args.command == "fetch-catalog" else args.verbose
+    # A download that prints nothing looks like a hang, so the fetch commands
+    # start at info rather than warning.
+    verbosity = (
+        max(args.verbose, 1)
+        if args.command in ("fetch-catalog", "fetch-satellites")
+        else args.verbose
+    )
     logging.basicConfig(
         level=[logging.WARNING, logging.INFO, logging.DEBUG][min(verbosity, 2)],
         format="%(asctime)s %(levelname)-7s %(name)s: %(message)s",
@@ -163,6 +271,8 @@ def main(argv: list[str] | None = None) -> int:
     )
     if args.command == "fetch-catalog":
         return cmd_fetch_catalog(args)
+    if args.command == "fetch-satellites":
+        return cmd_fetch_satellites(args)
 
     try:
         cfg = load_config(args)

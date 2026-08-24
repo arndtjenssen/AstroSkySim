@@ -282,6 +282,7 @@ class CameraBase(Device):
         cam.exposing = True
         cam.aborted = False
         cam.last_start_time = self.rig.iso_utc
+        cam.start_jd = self.rig.jd
         vec["CCD_EXPOSURE_VALUE"].value = cam.remaining_s
         self.push(vec, state=PropState.BUSY)
         if cam.exposure_s <= 0:
@@ -506,6 +507,10 @@ class CameraBase(Device):
         names = cfg.filter_wheel.names
         h["FILTER"] = names[min(self.rig.filter.slot - 1, len(names) - 1)]
         h["ROTATANG"] = (round(self.rig.sky_position_angle, 3), "[deg] rotator sky angle")
+        if self.rig.satellites is not None:
+            # Ground truth for whatever the client does about trails: a rejection
+            # stack has no other way to know whether a frame really had one.
+            h["NSATS"] = (cam.last_satellites, "satellite trails simulated in this frame")
         # numpy row 0 is the bottom row of the FITS image.
         h["ROWORDER"] = "BOTTOM-UP"
         if s.bayer != "MONO":

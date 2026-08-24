@@ -136,6 +136,12 @@ class CameraState:
     last_wcs: object | None = None
     last_exposure_s: float = -1.0
     last_start_time: str = ""
+    #: Start of the current exposure as a JD. Satellite trails are integrated
+    #: over the exposure *window*, and the readout runs in a thread minutes
+    #: after the shutter opened on a long sub, so "now" is not the answer.
+    start_jd: float = 0.0
+    #: Satellites that reached the sensor in the last frame, for the header.
+    last_satellites: int = 0
     #: Bumped whenever a new frame lands, so devices can detect staleness.
     sequence: int = 0
 
@@ -163,6 +169,10 @@ class Rig:
         self.capture_lock = asyncio.Lock()
         self._start_jd = float(Time.now().jd)
         self.source = None  # injected by build_rig to avoid an import cycle
+        #: ``SatelliteSky`` or None. None covers every ordinary reason there are
+        #: no satellites - switched off, nothing fetched, extra not installed -
+        #: so the imaging path only ever asks whether it is there.
+        self.satellites = None
 
         self.focuser.position = float(c.focuser.perfect_focus)
         self.focuser.target = self.focuser.position
@@ -568,6 +578,44 @@ class Rig:
             position_angle_deg=self.sky_position_angle,
         )
 
+    def add_satellite_trails(
+        self, cam: CameraState, electrons: np.ndarray, wcs, optics: Optics
+    ) -> np.ndarray:
+        """Satellite trails over an already-rendered frame.
+
+        Deliberately not an ``ImageSource``. A source answers "what is on the
+        sky in this direction" and reprojects a static scene; a trail is an
+        integration over *when the shutter was open*, which is not in a
+        ``RenderContext`` and should not have to be. Adding it here also keeps
+        it clear of the composite path's point-source suppression, which would
+        otherwise erase exactly the thing it draws.
+
+        Light frames only: a satellite cannot reach a bias, a dark or a flat,
+        and a trail in a calibration frame would be a bug a client cannot
+        distinguish from a real one.
+        """
+        cam.last_satellites = 0
+        if self.satellites is None or cam.frame_type != 0 or cam.exposure_s <= 0:
+            return electrons
+        # The readout runs in a thread and can start minutes after the shutter
+        # opened, so the window is anchored on the recorded start, not on now.
+        start_jd = cam.start_jd or (self.jd - cam.exposure_s / 86400.0)
+        try:
+            trails, drawn = self.satellites.render(
+                wcs=wcs,
+                shape=electrons.shape,
+                optics=optics,
+                exposure_s=cam.exposure_s,
+                jd_end=start_jd + cam.exposure_s / 86400.0,
+            )
+        except Exception:
+            # A frame is worth more than a trail: the same reasoning as the
+            # composite background falling back to stars only.
+            log.exception("satellite trails failed; frame delivered without them")
+            return electrons
+        cam.last_satellites = len(drawn)
+        return electrons + trails
+
     def capture(self, cam: CameraState) -> np.ndarray:
         """Produce one frame in ADU, honouring binning, subframe and type."""
         s = self.sensor_cfg(cam)
@@ -602,6 +650,7 @@ class Rig:
             if cam.frame_type == 3:  # flat: uniform illumination, no stars
                 electrons = np.full_like(electrons, 0.4 * s.well_depth_e)
 
+        electrons = self.add_satellite_trails(cam, electrons, full_wcs, optics)
         electrons = apply_bayer(electrons, s.bayer)
         sensor = self.sensor_model(cam)
         electrons = add_sky_and_noise(
@@ -637,10 +686,15 @@ def _wrap180(deg: float) -> float:
 
 
 def build_rig(cfg: Config) -> Rig:
+    from .satellites.config import load_satellites_config
+    from .satellites.trails import build_satellite_sky
     from .sources.registry import build_source
 
     rig = Rig(cfg)
     rig.source = build_source(cfg)
+    rig.satellites = build_satellite_sky(
+        load_satellites_config(cfg.satellites), cfg.site, rig.jd
+    )
     g = cfg.guide_sensor
     log.info(
         "rig ready: imaging %dx%d px at %.2f\"/px, guider %dx%d px at %.2f\"/px "

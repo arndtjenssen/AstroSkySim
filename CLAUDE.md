@@ -19,6 +19,7 @@ licence header in `src/astroskysim/__init__.py` intact.
 ```bash
 uv sync --all-extras --group dev
 uv run astroskysim fetch-catalog                    # ~56 MB .290 database, once
+uv run astroskysim fetch-satellites                 # orbital elements, occasionally
 uv run astroskysim -c examples/sim.toml -v          # -v info, -vv debug
 uv run pytest -q                               # ~20 s, no network needed
 uv run pytest tests/test_end_to_end.py::test_slew_moves_and_settles
@@ -30,8 +31,8 @@ uv run ruff check src tests
 comments on `vec.apply(...)` / `vec.selected` are hand-placed for a checker that is not wired up, so
 don't trust them as evidence a type is correct.
 
-CLI flags override the TOML (`--port`, `--host`, `--mode`, `--survey`, `--catalog-dir`); everything
-else is config-only. Note `examples/sim.toml` uses **port 7625**, while the code default and the
+CLI flags override the TOML (`--port`, `--host`, `--mode`, `--survey`, `--catalog-dir`,
+`--satellites`); everything else is config-only. Note `examples/sim.toml` uses **port 7625**, while the code default and the
 README are 7624.
 
 `catalog/` is **gitignored except its README** — the `.290` files are fetched, not committed. Without
@@ -188,7 +189,18 @@ is the specific bug this rules out. `tests/test_sources.py` asserts this against
 fetched as FITS, never JPEG/GIF, so a real WCS arrives with the pixels.
 
 `dss.py` has three back ends keyed by the `survey` prefix: `hips:` (CDS hips2fits, the default),
-`skyview:` and `eso:`. Two hips2fits-specific traps, both guarded and both with tests:
+`skyview:` and `eso:`. Three hips2fits-specific traps, all guarded and all with tests:
+
+- **CDS hosts may fail independently, so `HIPS_BASES` is a chain and not a preference.**
+  `HipsEndpoint` walks the list and **pins the first host that answers for the process**;
+  `sources/registry.py` builds *one*
+  endpoint and hands it to every layer, because with a `DssSource` per filter a per-layer endpoint
+  rediscovers the dead host once per filter. Two rules stop the failover being worse than none: a
+  host with an alternate behind it gets `probe_timeout_s` (15 s) not `timeout_s` — safe because
+  `urlopen`'s timeout is per socket operation, so only silence trips it and not a slow transfer —
+  and a 4xx raises immediately instead of failing over, since an unknown HiPS id is the same 400 on
+  every mirror and retrying it reports the last host's message instead of the real one. 408/429 are
+  excluded from that: both are about *this* host right now.
 
 - **Colour HiPS are not an image source.** `format=fits` on a `.../color` HiPS returns a
   `(4, H, W)` uint8 RGBA cube — the JPEG tiles in a FITS wrapper, bright cores clipped to 255.
@@ -228,6 +240,57 @@ Two rules carry the physics, and both are easy to undo by accident:
 
 `sky/` — `catalog.py` (`.290` reader and area indexing), `render.py` (PSF, defocus hyperbola, noise,
 bayer, binning), `wcs.py` (sensor WCS plus closed-form LST and alt/az).
+
+### Satellite trails
+
+`satellites/` is `config.py` (the shared source list), `tle.py` (Celestrak download and element
+parsing) and `trails.py` (SGP4, illumination, the swept PSF). Four decisions carry it:
+
+- **The config is shared and found by search, not named by a rig config.** What is in orbit is a
+  property of the machine and the week, so `--satellites` → `[satellites] config` →
+  `./satellites.toml` → `~/.config/astroskysim/satellites.toml`, then built-in defaults identical
+  to the shipped template (`default_config_text()` is *generated from* `DEFAULT_SOURCES`, so the
+  file a user edits and the defaults they get without one cannot drift — a test parses it back).
+  A rig config gets a pointer and an off switch only; there is no `enabled = true` there.
+  **`tests/conftest.py` pins satellites off for every test**, because otherwise a machine that has
+  run `fetch-satellites` renders trails into every end-to-end frame and CI does not.
+- **A trail is not an `ImageSource`.** A source answers "what is on the sky in this direction" and
+  reprojects a static scene; a trail is an integration over *when the shutter was open*, which is
+  not in a `RenderContext`. So `Rig.add_satellite_trails` runs after `source.render` and before
+  `apply_bayer` — also downstream of composite's `suppress_point_sources`, which would otherwise
+  erase it. Light frames only (`frame_type == 0`), and the window is anchored on `cam.start_jd`,
+  not on `rig.jd`: the readout runs in a thread and can start minutes after the shutter opened.
+- **Brightness is flux per *dwell time*.** Sub-pixel points carry `rate x dt`, so the level along a
+  trail is independent of how long the shutter stays open afterwards and a fast satellite lays down
+  a fainter line than a slow one from the same magnitude. Multiplying the rate by the exposure
+  instead is the hundred-fold error, and it looks entirely plausible in the frame
+  (`test_the_trail_is_flux_per_dwell_time_not_flux_per_frame`).
+- **The search cone is derived from the coarse step, not configured beside it.** Every object is
+  propagated at `coarse_step_s` to find candidates; a LEO satellite covers up to 2.5 °/s, so the
+  guard radius is `MAX_ANGULAR_RATE_DEG_S * coarse_step_s`. Configure them separately and a coarser
+  search silently loses trails — a test renders the same field at 0.5 s and 30 s steps and demands
+  the same sky. Measured cost: 0.6 s for a 300 s sub on a 3008² sensor against 12000 objects.
+
+Traps the code guards, all with tests:
+
+- **Celestrak answers "you already have this" with HTTP 403**, not 304, and only the body tells it
+  apart from a rate limit. `NotModified` turns it into `status="fresh"` with the cached count;
+  reported as a rate limit it sends the user off to wait out a throttle that does not exist, and
+  `--force` cannot help because the refusal is server-side.
+- **A 200 carrying "No GP data found" parses to zero satellites.** The response is parsed *before*
+  it replaces the cached file, so a failure leaves last week's elements in place. Stale beats empty.
+- **Element staleness is the *median* epoch, not the newest.** High orbits are routinely issued with
+  epochs a day or two in the future, so `max()` sits ahead of now while 800 others are a fortnight
+  old and the check never fires.
+- **`get_sun` is geocentric GCRS.** Transforming it to FK5 *with its distance attached* routes
+  through barycentric ICRS and puts the Sun 160° from where it is. `sun_teme_km` is the USNO
+  low-precision series (0.01° against astropy, pinned like `fast_lst_deg`) and the test compares
+  directions only.
+
+`std_mag` is one number per source list, which is an ordering (ISS against Starlink) rather than
+photometry: per-object standard magnitudes need a magnitude database no TLE carries. Positions are
+TEME treated as equinox of date — a ~1.1″ difference, three orders of magnitude below the error a
+TLE a few days old already carries.
 
 ### One photometric scale
 
