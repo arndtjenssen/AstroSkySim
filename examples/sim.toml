@@ -133,9 +133,7 @@ allow_synthetic_fallback = true
 #   survey = "eso:DSS"
 # Monochrome HiPS only: the ".../color" ones are 8-bit RGBA transcoded from JPEG
 # and are rejected at decode.
-# survey = "eso:DSS"
-survey = "skyview:DSS"
-# survey = "hips:CDS/P/DSS2/red"
+survey = "skyview:dss"
 # Downloads are keyed on the pointing snapped to a grid, so tracking noise does
 # not defeat the cache. ~ is expanded.
 cache_dir = "~/.cache/astroskysim"
@@ -190,22 +188,22 @@ ref_value = 5000.0
 # sky, sharp, and its passband contains Ha so emission nebulae actually show.
 # 1.2 mag brighter than R below, because L passes roughly three times the band.
 [source.dss.per_filter.L]
-survey = "hips:CDS/P/DSS2/red"
+survey = "skyview:dss2r"
 ref_mag_arcsec2 = 19.3
 ref_value = 5000.0
 
 [source.dss.per_filter.R]
-survey = "hips:CDS/P/DSS2/red"
+survey = "skyview:dss2r"
 ref_mag_arcsec2 = 20.5
 ref_value = 5000.0
 
 [source.dss.per_filter.G]
-survey = "hips:CDS/P/DSS2/blue"
+survey = "skyview:dss2b"
 ref_mag_arcsec2 = 22.0
 ref_value = 4000.0
 
 [source.dss.per_filter.B]
-survey = "hips:CDS/P/DSS2/blue"
+survey = "skyview:dss2b"
 ref_mag_arcsec2 = 22.5
 ref_value = 4000.0
 
