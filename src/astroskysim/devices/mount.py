@@ -360,12 +360,25 @@ class Mount(GuidePulseMixin, Device):
                 it.value = False
             self.push(v, state=PropState.IDLE)
         self.push(vec, state=PropState.OK, message="motion aborted")
-        self.push(self.eq, state=PropState.IDLE)
+        # An abort stops the *slew*; a tracking mount is still tracking, and a
+        # flat Idle here reads as "stopped" until the next tick corrects it.
+        self.push(self.eq, state=self._eq_state())
 
     async def _w_track_state(self, vec: Vector, values: dict[str, str]) -> None:
         vec.apply(values)  # type: ignore[attr-defined]
-        self.rig.mount.tracking = vec.selected == "TRACK_ON"  # type: ignore[attr-defined]
+        wanted = vec.selected == "TRACK_ON"  # type: ignore[attr-defined]
+        if wanted and self.rig.mount.parked:
+            # Roll the switch back, or the client keeps showing the On it asked
+            # for. Coalescing merges this into the one alert below.
+            vec["TRACK_ON"].value = False
+            vec["TRACK_OFF"].value = True
+            self.push(vec, state=PropState.ALERT, message="mount is parked")
+            return
+        self.rig.mount.tracking = wanted
         self.push(vec, state=PropState.OK)
+        # The status a client displays comes from EQUATORIAL_EOD_COORD, so Off
+        # is not visible until that goes out too.
+        self.push(self.eq, state=self._eq_state())
 
     async def _w_track_rate(self, vec: Vector, values: dict[str, str]) -> None:
         vec.apply(values)  # type: ignore[attr-defined]
@@ -420,11 +433,15 @@ class Mount(GuidePulseMixin, Device):
             self.rig.slew_to(m.park_ra_deg, m.park_dec_deg)
             m.tracking = False
             self._parking = True
+            # slew_to turned tracking back on; the client has to be told it is
+            # off again, otherwise it shows a parked mount as tracking.
+            self._push_track_state()
             self.push(vec, state=PropState.BUSY, message="parking")
         else:
             m.parked = False
             self._parking = False
             self.push(vec, state=PropState.OK, message="unparked")
+            self.push(self.eq, state=self._eq_state())
 
     _parking = False
 
@@ -500,6 +517,40 @@ class Mount(GuidePulseMixin, Device):
         self.push(vec, state=PropState.OK)
 
     # -- periodic ----------------------------------------------------------
+    def _eq_state(self) -> PropState:
+        """The state a client reads the mount's *status* out of.
+
+        Ekos does not use ``TELESCOPE_TRACK_STATE`` for its status display: it
+        maps the state attribute of ``EQUATORIAL_EOD_COORD`` alone (Idle ->
+        parked or idle, Ok -> tracking, Busy -> slewing, or parking when
+        ``TELESCOPE_PARK`` is Busy too). Reporting Ok whenever the mount is not
+        slewing therefore shows a parked, stationary mount as tracking, and
+        overwrites the switch a moment after the user pressed Off. This mirrors
+        INDI::Telescope::NewRaDec, which is the behaviour every real driver has.
+        """
+        m = self.rig.mount
+        if m.slewing:
+            return PropState.BUSY
+        if m.parked or not m.tracking:
+            return PropState.IDLE
+        return PropState.OK
+
+    def _push_track_state(self) -> None:
+        """Report ``TELESCOPE_TRACK_STATE`` from the rig, not from the switch.
+
+        Tracking is turned off by parking and back on by any slew, so the
+        switch a client last wrote is not the truth for long.
+        """
+        tracking = self.rig.mount.tracking
+        if (
+            self.track_state["TRACK_ON"].value == tracking
+            and self.track_state["TRACK_OFF"].value != tracking
+        ):
+            return
+        self.track_state["TRACK_ON"].value = tracking
+        self.track_state["TRACK_OFF"].value = not tracking
+        self.push(self.track_state, state=PropState.OK)
+
     def _push_pier_side(self) -> None:
         side = self.rig.mount.pier_side
         self.pier_side["PIER_EAST"].value = side == 1
@@ -510,19 +561,13 @@ class Mount(GuidePulseMixin, Device):
         m = self.rig.mount
         was_slewing = self.eq.state is PropState.BUSY
 
-        self.eq["RA"].value = m.ra_deg / 15.0
-        self.eq["DEC"].value = m.dec_deg
-        state = PropState.BUSY if m.slewing else PropState.OK
-        # While slewing, clients expect a steady stream of positions.
-        if m.slewing or was_slewing or int(self.rig.elapsed_s) % 2 == 0:
-            self.push(self.eq, state=state)
-
+        # Settle before the position goes out: parking latches ``parked`` and a
+        # SLEW clears ``tracking``, and both change the state the client reads
+        # its status from. Pushing the position first sends one stale Ok, which
+        # is the whole frame Ekos needs to latch "tracking".
         if was_slewing and not m.slewing:
             if self._stop_tracking_after_slew:
                 m.tracking = False
-                self.track_state["TRACK_ON"].value = False
-                self.track_state["TRACK_OFF"].value = True
-                self.push(self.track_state, state=PropState.OK)
                 self._stop_tracking_after_slew = False
             if self._parking:
                 m.parked = True
@@ -535,6 +580,17 @@ class Mount(GuidePulseMixin, Device):
                     it.value = False
                 self.push(self.home, state=PropState.OK, message="at home")
             self._push_pier_side()
+
+        self.eq["RA"].value = m.ra_deg / 15.0
+        self.eq["DEC"].value = m.dec_deg
+        state = self._eq_state()
+        # A status change has to go out on the tick it happened, not on the
+        # next two-second heartbeat.
+        changed = state is not self.eq.state
+        # While slewing, clients expect a steady stream of positions.
+        if m.slewing or was_slewing or changed or int(self.rig.elapsed_s) % 2 == 0:
+            self.push(self.eq, state=state)
+        self._push_track_state()
 
         az, alt = self.rig.altaz()
         self.horiz["ALT"].value = alt

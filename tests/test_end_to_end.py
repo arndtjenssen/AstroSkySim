@@ -220,6 +220,80 @@ async def test_slew_moves_and_settles():
         await c.close()
 
 
+async def test_the_mount_status_is_reported_in_the_eq_coord_state():
+    """Ekos reads tracking out of ``EQUATORIAL_EOD_COORD``'s state attribute.
+
+    ``TELESCOPE_TRACK_STATE`` is a control, not the status display: Ekos maps
+    the state of the coordinate property alone (Idle -> parked/idle, Ok ->
+    tracking, Busy -> slewing). Reporting Ok whenever the mount is not slewing
+    showed a parked mount as tracking, and put the indicator back to On a tick
+    after the user pressed Off - which is exactly what was reported.
+    """
+    async with Harness(make_config(**{"mount.slew_rate_deg_s": 90.0})) as h:
+        rig = h.server.rig
+        c = await h.connect()
+        await c.send('<getProperties device="AstroSkySim Telescope"/>')
+        await c.pump(0.4)
+
+        async def eq_state(want: str):
+            return await c.until(
+                lambda e: e.tag == "setNumberVector"
+                and e.name == "EQUATORIAL_EOD_COORD"
+                and e.get("state") == want
+            )
+
+        # Tracking: Ok.
+        assert rig.mount.tracking
+        c.mark()
+        await eq_state("Ok")
+
+        # Off must stick, not be overwritten by the next periodic push.
+        c.mark()
+        await c.send(
+            '<newSwitchVector device="AstroSkySim Telescope" name="TELESCOPE_TRACK_STATE">'
+            '<oneSwitch name="TRACK_OFF">On</oneSwitch></newSwitchVector>'
+        )
+        await eq_state("Idle")
+        await c.pump(2.5)
+        assert not rig.mount.tracking
+        states = [e.get("state") for e in c.vectors("EQUATORIAL_EOD_COORD")]
+        assert "Ok" not in states, f"tracking came back on its own: {states}"
+
+        # Park: still Idle once the slew finishes, and the switch says Off.
+        c.mark()
+        await c.send(
+            '<newSwitchVector device="AstroSkySim Telescope" name="TELESCOPE_PARK">'
+            '<oneSwitch name="PARK">On</oneSwitch></newSwitchVector>'
+        )
+        await c.until(
+            lambda e: e.tag == "setSwitchVector"
+            and e.name == "TELESCOPE_PARK"
+            and e.get("state") == "Ok"
+        )
+        assert rig.mount.parked and not rig.mount.tracking
+        c.mark()
+        await c.pump(2.5)
+        states = [e.get("state") for e in c.vectors("EQUATORIAL_EOD_COORD")]
+        assert states and "Ok" not in states, f"a parked mount reported tracking: {states}"
+        track = c.vectors("TELESCOPE_TRACK_STATE")
+        if track:
+            assert track[-1].child_values() == {"TRACK_ON": "Off", "TRACK_OFF": "On"}
+
+        # A parked mount cannot be told to track.
+        c.mark()
+        await c.send(
+            '<newSwitchVector device="AstroSkySim Telescope" name="TELESCOPE_TRACK_STATE">'
+            '<oneSwitch name="TRACK_ON">On</oneSwitch></newSwitchVector>'
+        )
+        el = await c.until(
+            lambda e: e.tag == "setSwitchVector" and e.name == "TELESCOPE_TRACK_STATE"
+        )
+        assert el.get("state") == "Alert"
+        assert el.child_values()["TRACK_ON"] == "Off"
+        assert not rig.mount.tracking
+        await c.close()
+
+
 async def test_sync_then_slew_removes_the_pointing_error():
     """Plate-solve-and-centre has to converge.
 

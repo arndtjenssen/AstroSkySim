@@ -360,6 +360,13 @@ Devices push continuously, so call `client.mark()` before sending the command un
 
 ## Gotchas
 
+- **The mount's status is `EQUATORIAL_EOD_COORD`'s `state`, not `TELESCOPE_TRACK_STATE`.** Ekos maps
+  that one attribute: Idle = parked/idle, Ok = tracking, Busy = slewing (parking when
+  `TELESCOPE_PARK` is Busy too). `Mount._eq_state` derives it from the rig, mirroring
+  `INDI::Telescope::NewRaDec`. Pushing `Ok` whenever the mount is not slewing is the natural-looking
+  bug: it showed a parked mount as tracking and reverted the indicator a tick after **OFF** was
+  pressed. `_push_track_state` reports the switch from `rig.mount.tracking` for the same reason —
+  parking clears the flag that `slew_to` had just set.
 - `server.device_prefix` in the config is **dead**. Device names are hardcoded class attributes
   (`Camera.device_name` etc.); renaming means editing those.
 - `Vector.enabled=False` gates a property out of the announced set. Nothing currently flips it at
