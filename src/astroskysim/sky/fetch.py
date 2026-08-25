@@ -70,7 +70,7 @@ MIRROR_TAG = "catalog-g14-v1"
 MIRROR_URL = f"https://github.com/arndtjenssen/AstroSkySim/releases/download/{MIRROR_TAG}"
 
 RELEASES: dict[str, CatalogRelease] = {
-    # The digest is of the archive built by the `zip -r -9` line in the README:
+    # The digest is of the archive built by the `zip -r -9` line in catalog/README.md:
     # the 290 g14 cells plus the acknowledgement, flat, no enclosing directory.
     # Zip output is not reproducible across tools, so re-zipping the same files
     # with something else needs this re-pinned - run the command and paste back
@@ -91,7 +91,7 @@ RELEASES: dict[str, CatalogRelease] = {
     # it deliberately: everything astrometric here depends on this data, and
     # "the bytes changed under you" is worth a hard failure and a re-pin.
     #
-    # NOT a drop-in for g14 - see the README. ASTAP's suffix is *density*
+    # NOT a drop-in for g14 - see TECHNICAL.md. ASTAP's suffix is *density*
     # (<=500 stars/sq deg), not magnitude, so it is deeper than g14 at high
     # galactic latitude and *shallower* in the plane, where it discards stars
     # g14 has.

@@ -11,8 +11,9 @@ Alpaca, no ASCOM**, and none of those are wanted. The project descends conceptua
 Kleijn's "Sky Simulator for Ascom and Alpaca" — an independent implementation of the same idea,
 not a translation of it. See the Acknowledgements section of `README.md`.
 
-`README.md` records the design decisions and the reasoning behind each device's property set —
-read it before adding a device property. This file is the short version. GPLv3-or-later; keep the
+`TECHNICAL.md` records the design decisions and the reasoning behind each device's property set —
+read it before adding a device property. This file is the short version; `README.md` is the
+user-facing overview (install, usage, configuration). GPLv3-or-later; keep the
 licence header in `src/astroskysim/__init__.py` intact.
 
 ## Commands
@@ -65,7 +66,7 @@ magnitudes, Gaia to 0.02" rms), so nothing in `catalog.py` needed touching — b
 superset of g14**. It reaches BP 18.7 at the galactic pole and only BP 13.4 in Cygnus, where it
 *discards* half the stars g14 has, flattening the sky's real 23:1 density contrast to about 1:1.
 Guide-star selection and plate solve success are exactly what that contrast drives, so g14 stays the
-default; the table is in `README.md`. Every measured number in this file is g14's, and
+default; the table is in `TECHNICAL.md`. Every measured number in this file is g14's, and
 `tests/test_catalog.py` hardcodes g14 expectations (`mag.max() == 14.0`, 11,290,236 stars, 7 boundary
 strays), so switching the default would invalidate the fixtures rather than just change the pixels.
 
