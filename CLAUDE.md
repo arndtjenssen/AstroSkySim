@@ -5,7 +5,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## What this is
 
 AstroSkySim (`astroskysim`) — a headless INDI server simulating a full astrophotography rig
-(mount, imaging camera, guide camera, focuser, rotator, filter wheel). **INDI only: no GUI, no
+(mount, imaging camera, guide camera, focuser, rotator, filter wheel, and an optional weather
+station reporting the simulated wind). **INDI only: no GUI, no
 Alpaca, no ASCOM**, and none of those are wanted. The project descends conceptually from Han
 Kleijn's "Sky Simulator for Ascom and Alpaca" — an independent implementation of the same idea,
 not a translation of it. See the Acknowledgements section of `README.md`.
@@ -291,6 +292,75 @@ photometry: per-object standard magnitudes need a magnitude database no TLE carr
 TEME treated as equinox of date — a ~1.1″ difference, three orders of magnitude below the error a
 TLE a few days old already carries.
 
+### Wind and gusts
+
+`wind.py` is `WindModel` (weather → deflection → history), and `Rig` consumes it in exactly two
+places. Off by default: **every measured number in this file was taken against a still sky**, so
+`wind.enabled = true` as a default would move all of them at once. Four decisions carry it:
+
+- **Wind is the only error term resolved *within* an exposure.** Everything else in
+  `actual_pointing` is read once per frame at readout, so it displaces a round star. Wind is
+  recorded as a path at a fixed **128 Hz** sub-step into a ring buffer and convolved into the frame,
+  which is what makes a streak, a smear or a V instead of a displaced disc. Sampling at the 10 Hz
+  tick would alias a 4 Hz ring-down into a slow wobble, which is why the sub-step is fixed and not
+  the tick.
+- **`Rig.capture` takes the window once and hands the halves to different consumers.** `build_wcs`
+  gets the window **mean**, the kernel gets the **zero-mean path** about that mean. Re-reading the
+  wind for either one is the bug this shape exists to prevent: `capture` runs in the readout thread
+  *after the shutter closed*, so an instantaneous read is a sample from outside the exposure
+  entirely, and the frame translates by the difference — for a gust, the whole amplitude. The tick
+  also keeps stepping the model during `capture`, so the two would not even read the same value.
+  `pointing_at(wind_offset)` is the seam; `actual_pointing` is it with `None`.
+- **`WindModel` owns its RNG, seeded `(cfg.seed, 0x77494E44)`.** `actual_pointing` draws
+  `rig.rng.normal` on *every read*, so a wind path sharing that generator would depend on how many
+  times unrelated code touched a property — reproducible in principle, not in practice. The distinct
+  spawn key also stops wind and tracking noise sharing a phase every run.
+- **The oscillator step is a closed-form 2×2 transition matrix**, like `fast_lst_deg` and for the
+  same reason. Being exact for *any* dt is load-bearing, not elegance: it lets a stalled tick be
+  caught up in one step rather than spinning through sub-steps, with wind time still exactly equal
+  to `elapsed_s`. Dropping sub-steps instead would desynchronise the index→time mapping the window
+  slice depends on. `[u, 0]` is a fixed point by construction, so DC gain is exactly 1 and a
+  sustained wind settles precisely on `response_arcsec_at_20kmh · (v/20)²`.
+
+Traps the code guards, all with tests:
+
+- **A mirrored smear looks entirely correct.** `out(p) = Σ K(d)·scene(p−d)`; reverse the sign and the
+  streak still has the right length and still lies along the wind. There are two kernel applications
+  (shifted views under `SMEAR_TAP_LIMIT` taps, `_convolve_fft` above), so
+  `test_the_two_smear_paths_agree` pins them against each other to 1e-9 on an *asymmetric* path — a
+  symmetric one is its own mirror and proves nothing. The weight floor is applied **before**
+  dispatch, or the branches disagree by the dropped weight and the test cannot check anything.
+- **The kernel must be odd-sized.** `_convolve_fft` crops at `kernel.shape // 2`, so an even kernel
+  injects a half-pixel translation — exactly the shift the zero-mean path prevents.
+- **`damping ≥ 1` silently deletes the feature.** Critically damped means no overshoot, no ringing,
+  no V-shapes, just a slow offset — hence `lt=1`. Likewise `probability = 1.0` divides by zero in
+  the Markov off-rate, and `resonance_hz` is bounded in the *validator* rather than with a `Field`
+  `le` so the error can say it is an aliasing limit rather than an arbitrary one.
+- **`path_to_pixels` must not divide by `cos(dec)`.** `actual_pointing` does, to turn a great-circle
+  offset into RA degrees; the CD matrix's first axis is already the projection plane's east
+  coordinate. Doing it twice shrinks the smear away from the pole. It takes the **WCS**, never a
+  plate scale, so a separate guide scope needs no `is_guider` branch — and it inverts
+  `pixel_scale_matrix` rather than calling `wcs_world2pix`, because TAN is not affine and a path that
+  is zero-mean in arcsec would only be *approximately* zero-mean in pixels.
+- **The ring buffer is read across threads and must not take `capture_lock`.** That lock is held
+  across a multi-second render, so taking it in the tick reintroduces the freeze `CameraBase.step`
+  spawns a thread to avoid. `History.slice` snapshots the write count and copies its window instead.
+- **An exposure longer than `history_s` warns.** A silently shortened window renders a shorter
+  streak, which reads as "the wind died down" rather than as missing history — and the WCS mean must
+  come from the *same* clamped window, or the frame translates.
+
+Measured cost on a 3008²: the FFT pair is flat at 0.155 s (the frame dominates), a tap is ~7.6 ms,
+so the crossover is ~16 taps and `SMEAR_TAP_LIMIT` is measured rather than guessed — at 75 taps the
+tap branch is 0.573 s against 0.153 s. A guide frame is ~0.015 s; sub-pixel smears are skipped.
+
+`devices/weather.py` is `WEATHER_INTERFACE` (**bit 7**, added to `indi/device.py`'s bitmask).
+`server.weather` defaults **false**: a client's profile enumerates devices, so defaulting it on adds
+a device to every existing Ekos profile. It is deliberately *not* derived from `wind.enabled` — two
+sources of truth for one switch. `WEATHER_STATUS`'s vector *state* is what Ekos reads for "is it
+safe", so a driver with readings and no status is decoration. It must not set `GUIDER_INTERFACE`, or
+`test_every_guider_interface_device_accepts_timed_pulses` will demand pulse properties of a weather
+station — the copy-paste-from-`mount.py` mistake.
+
 ### One photometric scale
 
 Point sources go through `magnitude_to_electrons`, extended ones through
@@ -367,6 +437,11 @@ Devices push continuously, so call `client.mark()` before sending the command un
   bug: it showed a parked mount as tracking and reverted the indicator a tick after **OFF** was
   pressed. `_push_track_state` reports the switch from `rig.mount.tracking` for the same reason —
   parking clears the flag that `slew_to` had just set.
+- **`test_get_properties_returns_all_six_devices` asserts an exact set.** It still passes only
+  because `server.weather` defaults off; a seventh device on by default breaks it, and the count is
+  in the test's name. `test_driver_interface_bitmasks` is the opposite trap — it asserts per key, so
+  a new device with a *wrong* bit would not fail it, which is why the weather bit is pinned
+  deliberately in `test_the_weather_device_appears_and_reports_the_wind`.
 - `server.device_prefix` in the config is **dead**. Device names are hardcoded class attributes
   (`Camera.device_name` etc.); renaming means editing those.
 - `Vector.enabled=False` gates a property out of the announced set. Nothing currently flips it at

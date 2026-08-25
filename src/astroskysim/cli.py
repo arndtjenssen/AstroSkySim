@@ -16,6 +16,7 @@ from .devices.filterwheel import FilterWheel
 from .devices.focuser import Focuser
 from .devices.mount import Mount
 from .devices.rotator import Rotator
+from .devices.weather import Weather
 from .indi.server import IndiServer
 from .rig import build_rig
 from .satellites.config import (
@@ -41,6 +42,7 @@ def build_server(cfg: Config) -> IndiServer:
         (s.focuser, Focuser),
         (s.rotator, Rotator),
         (s.filter_wheel, FilterWheel),
+        (s.weather, Weather),
     ):
         if enabled:
             server.add_device(cls(rig))

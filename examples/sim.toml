@@ -4,6 +4,12 @@ seed = 1234
 host = "0.0.0.0"
 port = 7625
 tick_hz = 10.0
+# A weather station reporting [wind] below, so a client can react to it.
+# Off by default because a client's profile enumerates devices,
+# and an unexpected extra one turns up in every
+# existing profile. The wind is simulated either way; without this nothing
+# reports it.
+weather = true
 
 [site]
 latitude = 49.39
@@ -41,8 +47,7 @@ hot_pixel_e_s = 200.0
 [sensor_guide_cam]
 width_px = 1936
 height_px = 1096
-pixel_size_um = 2.9      # 0.85"/px through the 700 mm OTA - oversampled, as an
-                         # OAG guider is; bin 2x2 from the client to fix that
+pixel_size_um = 2.9
 bayer = "MONO"
 bit_depth = 16
 well_depth_e = 12000.0   # small pixels, shallow well
@@ -103,6 +108,43 @@ periodic_error_period = 480.0
 tracking_noise = 0.5              # arcsec RMS
 azimuth_error = 20.0               # arcmin of polar misalignment
 elevation_error = 30.0
+
+# Wind, and what it does to a sub. Off by default; uncomment `enabled` to blow.
+#
+# Two effects, and the second is the one no other error term here produces. The
+# guide star moves, so a client's guider sees spikes and fights them - sustained
+# push it corrects with a lag, the ring-down after a gust it cannot, because that
+# is above any guider's correction bandwidth. And because the shift happens
+# *while the shutter is open*, the star is not a displaced disc: it is a streak, a
+# smear or a V, depending on where in the exposure the gust landed.
+#
+# The dependence on focal length needs no setting of its own. The deflection is
+# angular, so the plate scale does all of it: this rig is 432 mm on 3.76 um
+# pixels, i.e. 1.795"/px, so `response_arcsec_at_20kmh = 1.2` is two thirds of a
+# pixel here and 3.1 px on a 2000 mm SCT with the same camera. That is the unit
+# to watch - `astroskysim -v` logs the pixel equivalent for the rig you actually
+# configured, at both plate scales.
+#
+# A client can only *see* the wind if a weather device is advertised, which is
+# `server.weather = true` above. Without it the physics still runs; nothing
+# reports it.
+[wind]
+enabled = true
+speed_kmh = 11.0                   # mean sustained speed while it is blowing
+probability = 0.45                 # fraction of the session that is windy at all
+duration_s = 180.0                 # mean length of a windy spell
+gust_speed_kmh = 35.0              # peak in a gust; must be >= speed_kmh
+gust_probability = 0.15            # fraction of a windy spell spent gusting
+gust_duration_s = 2.5
+# The one calibration constant, in arcsec at 20 km/h, scaling as v^2. It lumps
+# sail area, drag, lever arm and mount stiffness into a single number, because
+# four of those five are unknowable for a real rig. Tune it against what your
+# mount actually does in a breeze.
+response_arcsec_at_20kmh = 2
+resonance_hz = 4.0                 # tube-on-mount ring-down; this makes the V-shapes
+damping = 0.12                     # must be < 1, or there is no ringing at all
+axis_ratio_ra_dec = 1.5            # RA is the softer axis, so spikes land there
+buffet_fraction = 0.25             # high-frequency component of the push
 
 # Satellite trails. Everything about them - which lists are in the sky, how
 # bright they are, where the elements are cached - lives in its own file, found

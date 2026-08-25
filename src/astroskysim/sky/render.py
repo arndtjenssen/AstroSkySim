@@ -235,6 +235,113 @@ def render_stars(
     return np.clip(cropped, 0.0, None)
 
 
+#: Below this peak-to-peak pixel extent a smear is inside the PSF and the frame
+#: is returned untouched. Keeps a calm night free.
+MIN_SMEAR_PX = 0.25
+
+#: Above this many nonzero kernel taps the FFT pair is cheaper than accumulating
+#: shifted views.
+#:
+#: Measured on a 3008x3008 frame, which is where the choice matters: the FFT is
+#: flat at ~0.155 s whatever the kernel, because ``_convolve_fft`` zero-pads the
+#: *frame* to 3072 either way, while a tap costs ~7.6 ms. So the crossover sits
+#: between 15 taps (0.127 s) and 23 (0.177 s). Guessing a larger number is the
+#: expensive mistake: at 75 taps the tap branch takes 0.573 s against the FFT's
+#: 0.153 s, and it is a long lightly-damped ring-down - exactly the case this
+#: feature exists to render - that produces those tap counts.
+SMEAR_TAP_LIMIT = 16
+
+#: Taps below this fraction of the peak are dropped before the count is taken.
+#: A long ring-down deposits a very faint halo of single samples that costs a tap
+#: each and contributes nothing visible.
+_SMEAR_WEIGHT_FLOOR = 1e-4
+
+
+def smear_kernel(dx: np.ndarray, dy: np.ndarray) -> np.ndarray | None:
+    """Motion kernel for a zero-mean pixel path, normalised to sum 1.
+
+    ``None`` means the path is not worth convolving.
+
+    Two properties are load-bearing and both are easy to lose:
+
+    * **Odd size.** ``_convolve_fft`` crops at ``kernel.shape // 2``, so an even
+      kernel injects a half-pixel translation - precisely the frame shift the
+      zero-mean path exists to avoid, and invisible in the pixels.
+    * **Renormalised after the splat.** ``_splat`` silently drops out-of-range
+      samples, so a kernel whose path overran the half-width would lose weight
+      and dim the frame. The half-width is derived from the path, so that should
+      not happen; dividing by the sum means it cannot.
+
+    Unlike a satellite trail, this conserves flux rather than depositing per
+    dwell time: wind redistributes a star's fixed electron budget, so a streaked
+    star is fainter per pixel and the same total. Weighting by dwell falls out of
+    the samples being uniform in time - one sample, one unit of dwell.
+    """
+    if dx.size == 0:
+        return None
+    extent = max(float(np.ptp(dx)), float(np.ptp(dy)))
+    if extent < MIN_SMEAR_PX:
+        return None
+
+    half = int(np.ceil(max(np.abs(dx).max(), np.abs(dy).max())))
+    if half < 1:
+        half = 1
+    size = 2 * half + 1
+    k = _splat((size, size), dx + half, dy + half, np.full(dx.size, 1.0 / dx.size))
+    total = k.sum()
+    if total <= 0.0:
+        return None
+    return k / total
+
+
+def apply_smear(electrons: np.ndarray, kernel: np.ndarray) -> np.ndarray:
+    """Convolve a frame with a motion kernel, preserving its edges.
+
+    ``_convolve_fft`` zero-pads, which would darken a border the width of the
+    kernel's half-width, so the frame is padded by edge replication first. That
+    padding is free in FFT terms up to a 16 px half-width: ``_next_fast_len``
+    sends 3008 + 4*16 to the same 3072 as 3008 alone.
+
+    Two applications of the *same* kernel, chosen on the tap count. Accumulating
+    shifted views is memory-bandwidth bound at roughly a hundredth of a second
+    per tap, so it wins by a wide margin for the small smears that dominate -
+    and the tap count is bounded by the path's spatial extent, not by how many
+    samples it holds. A 600 s sub ringing at 15 Hz revisits the same few dozen
+    pixels tens of thousands of times.
+
+    The sign is the trap: a source at ``s`` with the optics displaced by ``d``
+    lands at ``s + d``, so ``out(p) = sum_d K(d) * scene(p - d)``. Reversed, the
+    smear mirrors, which looks entirely plausible in a frame. Hence
+    ``test_the_two_smear_paths_agree``, which pins the branches against each
+    other rather than against an eyeball.
+    """
+    half = kernel.shape[0] // 2
+    padded = np.pad(electrons, half, mode="edge")
+    h, w = electrons.shape
+
+    # Threshold *before* dispatching, not inside the tap branch. A long
+    # ring-down leaves a halo of near-zero taps that costs a shifted view each
+    # and contributes nothing; dropping them is worth it there and costs nothing
+    # in the FFT, whose price is set by the frame. Doing it in one branch only
+    # would leave the two disagreeing by the dropped weight - which is precisely
+    # what ``test_the_two_smear_paths_agree`` would then be unable to check.
+    strong = kernel > _SMEAR_WEIGHT_FLOOR * kernel.max()
+    kernel = np.where(strong, kernel, 0.0)
+    kernel = kernel / kernel.sum()
+
+    if int(strong.sum()) > SMEAR_TAP_LIMIT:
+        return _convolve_fft(padded, kernel)[half : half + h, half : half + w]
+
+    ys, xs = np.nonzero(strong)
+    out = np.zeros_like(electrons)
+    for weight, ky, kx in zip(kernel[ys, xs], ys, xs, strict=True):
+        # d = (ky - half, kx - half); the source window is p - d.
+        oy = half - (int(ky) - half)
+        ox = half - (int(kx) - half)
+        out += weight * padded[oy : oy + h, ox : ox + w]
+    return out
+
+
 @dataclass(slots=True)
 class SensorModel:
     """Detector characteristics used to turn electrons into ADU."""

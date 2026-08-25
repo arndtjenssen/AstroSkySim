@@ -1,8 +1,10 @@
 # AstroSkySim
 
 Headless INDI simulator for a full astrophotography rig: mount, imaging camera,
-guide camera, focuser, rotator and filter wheel. Serves INDI on port 7625 — no
-GUI, no desktop application. Image sources are either artificial (from local star catalog), online surveys or a composite of both. Satellite streak simulation can be added optionally by downloading satellite databases.
+guide camera, focuser, rotator, filter wheel and an optional weather station. Something to play with when
+the weather is bad and one needs to stay at home.
+
+Serves INDI on port 7625 — no GUI, no desktop application. Image sources are either artificial (from local star catalog), online surveys or a composite of both. Satellite streak simulation can be added optionally by downloading satellite databases. Wind and gusts can be simulated too, including the mid-exposure star trailing they cause.
 
 AstroSkySim follows in the footsteps of Han Kleijn's
 [Sky Simulator for Ascom and Alpaca](https://sourceforge.net/projects/sky-simulator),
@@ -20,7 +22,7 @@ uv run astroskysim fetch-satellites               # orbital elements, occasional
 uv run astroskysim -c examples/sim.toml -v
 ```
 
-Then point KStars/Ekos, CCDciel or any INDI client at `localhost:7625`.
+Then point [KStars/Ekos](https://kstars.kde.org/), [CCDciel](https://sourceforge.net/projects/ccdciel/) or any INDI client at `localhost:7625`.
 
 Run tests with:
 
@@ -35,7 +37,6 @@ too large to keep in the repository and is fetched separately:
 
 ```bash
 uv run astroskysim fetch-catalog                       # -> ./catalog
-uv run astroskysim -c examples/sim.toml fetch-catalog   # -> source.artificial.catalog_dir
 ```
 
 It verifies a pinned SHA-256, unpacks the cells flat into the target directory,
@@ -157,14 +158,6 @@ independently: With one host that is the whole survey path down for
 however long the outage lasts, so `source.dss.hips_bases` is a failover chain and
 the first host that answers is remembered for the rest of the process.
 
-Two details keep the failover from costing more than it saves. A host that still
-has an alternate behind it gets `source.dss.hips_probe_timeout_s` (15 s) rather
-than the full `timeout_s`, which is safe because `urlopen`'s timeout applies per
-socket operation — a slow-but-streaming 18 MB download never trips it and only a
-genuine stall does. And a 4xx is raised immediately instead of being retried:
-an unknown HiPS id is the same 400 on every mirror, so failing over would burn a
-timeout per host and then report the wrong host's message.
-
 ```toml
 [source.dss]
 hips_bases = ["https://alasky.cds.unistra.fr/hips-image-services/hips2fits"]
@@ -244,7 +237,7 @@ the wrong field size.
 
 ## Satellite trails
 
-A long sub taken in the 2020s has satellites in it. AstroSkySim propagates real
+A long sub taken in the 2020s has often satellites in it. AstroSkySim propagates real
 orbital elements and draws the trails, so a client's rejection stack, its trail
 detector, or a human looking at a sub has something real to work on.
 
@@ -346,6 +339,116 @@ configured, because a LEO satellite can cross the whole field between two coarse
 samples: the step and the cone are one decision, and splitting them is how a
 coarser search silently loses trails.
 
+## Wind and gusts
+
+Without a dome the rig is exposed. Wind pushes the tube — continuously, and in
+gusts — and the mount deflects. Every other error term in this simulator is read
+**once per frame**, at readout, so it produces a frame-to-frame centroid shift
+and nothing else: a 300 s sub with 4″ of periodic error renders perfectly round
+stars at a displaced centre. Wind is the one that happens *while the shutter is
+open*, and it is what this section adds.
+
+```toml
+[server]
+weather = true          # else nothing reports the wind to a client
+
+[wind]
+enabled = true
+speed_kmh = 18.0                   # mean sustained speed while it is blowing
+probability = 0.45                 # fraction of the session that is windy at all
+duration_s = 180.0                 # mean length of a windy spell
+gust_speed_kmh = 45.0              # peak in a gust; must be >= speed_kmh
+gust_probability = 0.15            # fraction of a windy spell spent gusting
+gust_duration_s = 2.5
+response_arcsec_at_20kmh = 1.2     # the one calibration constant; scales as v^2
+resonance_hz = 4.0                 # ring-down; this is what makes the V-shapes
+damping = 0.12                     # must be < 1, or there is no ringing at all
+axis_ratio_ra_dec = 1.5            # RA is the softer axis, so spikes land there
+buffet_fraction = 0.25
+history_s = 900.0                  # bounds the longest sub that can be smeared
+```
+
+Off by default. Every measured number in the test suite was taken against a
+still sky, so a default of `true` would move all of them at once.
+
+### Two effects, one state
+
+The deflection is added to `actual_pointing`, in the same gap the other error
+terms live in. That is most of the feature, and it is nearly free: the guide
+camera images `actual_pointing`, so a gust throws the guide star, the client
+corrects what it sees, and the pulse moves `mount.ra_deg` — shifting reported and
+actual together. Sustained push therefore gets guided out with a lag and the
+ring-down does not, because it is above any guider's correction bandwidth.
+Nothing here computes an RMS; the client's RMS spike is the consequence.
+
+The **mid-exposure smear** is the other half. `Rig.apply_wind_smear` slices the
+deflection history over the exposure window, converts it to a pixel path, builds
+a motion kernel and convolves the frame with it. One kernel for the whole frame,
+which is exactly right for a translation: wind moves every star in the field
+together, so stars, survey nebulosity and any satellite trail smear as one.
+
+Two invariants carry it, and both are invisible in the pixels when broken:
+
+- **Flux is conserved.** The kernel sums to 1. This is the opposite of a
+  satellite trail, where brightness is flux per *dwell time* and a longer
+  exposure lays down a longer streak at the same surface brightness — wind
+  redistributes a star's fixed electron budget, so a streaked star is fainter per
+  pixel and the same total.
+- **The kernel is zero-mean, and the WCS carries the window mean.** So the smear
+  spreads a star without moving it, and a wind-ruined sub still plate-solves to
+  the true centre. `Rig.capture` takes the window **once** and hands the mean to
+  `build_wcs` and the path to the kernel, because `capture` runs in the readout
+  thread after the shutter closed — anything that re-reads the wind there gets a
+  sample from outside the exposure entirely, and the frame translates by the
+  difference. For a gust that is the whole amplitude.
+
+### Focal length, without a focal-length parameter
+
+The deflection is angular, so the plate scale does all of it. On 3.76 µm pixels
+the same 1.2″ shake is 0.7 px at 432 mm and 3.1 px at 2000 mm — a factor of five,
+exactly the focal-length ratio. `astroskysim -v` logs the pixel equivalent for
+the rig you configured, at both plate scales, because arcsec-versus-pixels is the
+unit trap in this section.
+
+Whether the *guider* resolves the shake it is meant to correct depends on its own
+plate scale, and both cameras are handled with no special case: each smear is
+built from that camera's own WCS. An oversampled off-axis guider (2.9 µm through
+the imaging OTA, 1.385″/px in `examples/sim.toml`) sees it slightly better than
+the imaging chip; a 240 mm guide scope sees it far more coarsely and genuinely
+under-resolves it.
+
+### What the frame gets
+
+**Light frames only**, like satellite trails: a wind smear on a flat is a no-op
+except at the border, and on a bias there is nothing to smear. The header carries
+`WINDKMH`, `GUSTKMH` and `SMEARPX` (peak-to-peak, in unbinned sensor pixels)
+for the same reason `NSATS` exists — a client looking at streaked stars cannot
+otherwise tell wind from a bad guide star or a slipped clutch.
+
+The smear is applied after the satellite trails and **before** `apply_bayer`,
+`add_sky_and_noise` and `add_hot_pixels`. Each of those three is deliberate: a
+real CFA samples a smeared scene rather than smearing an already-attenuated
+mosaic; convolving read noise would correlate it and leave the frame smoother
+than the sensor is; and being downstream of the composite source's point-source
+suppression keeps it from erasing the streak.
+
+### Cost
+
+The mount's ring-down is a few Hz, so the model integrates at a fixed 128 Hz
+sub-step — sampling at the 10 Hz tick would alias the ringing into a slow wobble
+— using a closed-form transition matrix for the damped oscillator. That is exact
+for any step, which is what lets a stalled tick be caught up in one step instead
+of spinning, with wind time still exactly equal to `elapsed_s`. Cost is tens of
+microseconds per tick; 900 s of history is ~115k samples in two float32 columns,
+under a megabyte.
+
+The smear is one convolution, applied two ways. Measured on a 3008² frame: the
+FFT pair is flat at **0.155 s** whatever the kernel, because the frame dominates,
+while accumulating a shifted view costs ~7.6 ms per kernel tap. So small smears
+take the taps (7 taps, 0.061 s) and large ones the FFT, crossing over around 16.
+A 2 s guide frame costs ~0.015 s. Sub-pixel smears are skipped outright, so a
+calm night is free.
+
 ## Devices
 
 INDI only. The property set is deliberately wide — a device that answers just
@@ -362,6 +465,9 @@ simulates is exposed:
   (backlash is simulated physically, so a client that compensates is really tested)
 - **Camera** — `CCD_COOLER_POWER`, `CCD_READOUT_MODE`, `CCD_STOP_EXPOSURE`
   (graceful stop that keeps the frame, as distinct from abort)
+- **Weather** — `WEATHER_PARAMETERS`, `WEATHER_STATUS`, per-parameter
+  `MIN_OK`/`MAX_OK`/`PERCENT_WARNING` thresholds, `WEATHER_UPDATE`. Off by
+  default (`server.weather`)
 
 The guide camera has its own sensor spec (above) rather than a copy of the
 imaging chip's, and `TELESCOPE_INFO`'s guider fields carry the guide scope rather
@@ -370,7 +476,7 @@ than echoing the main OTA.
 `TELESCOPE_OFFSET_RATES` is a documented extension: INDI has no standard
 property for RA/Dec offset rates, so the name is ours.
 
-Not implemented, by choice: dome, switch, safety monitor, observing conditions.
+Not implemented, by choice: dome, switch, safety monitor.
 
 ## Design notes
 
@@ -404,9 +510,19 @@ epoch of observation. Labelling them ICRS silently adds the full J2000-to-now
 precession — about 20 arcminutes today.
 
 **Reported vs actual pointing.** The mount reports the commanded position; the
-camera images the actual one. Polar misalignment, periodic error and tracking
-noise live in the gap, so guiding and plate-solve-and-centre loops have
+camera images the actual one. Polar misalignment, periodic error, tracking noise
+and wind live in the gap, so guiding and plate-solve-and-centre loops have
 something real to correct.
+
+**Only wind is resolved *within* an exposure.** The other error terms are read
+once per frame, at readout, so they displace a round star; a 300 s sub with 4″ of
+periodic error has perfectly round stars in the wrong place. Wind is recorded as
+a path while the shutter is open and convolved into the frame, which is what
+turns it into a streak, a smear or a V. That asymmetry is a deliberate limit and
+not an oversight — trailing from *any* of these terms would need the same history
+machinery, and wind is the one where a client is expected to lose the frame.
+`tests/test_wind.py` pins the two invariants that make it safe: flux is conserved
+and the smear does not move the star.
 
 **`GUIDER_INTERFACE` is a promise, not a label.** Bit 2 of `DRIVER_INTERFACE`
 means "this device has an ST4 port and accepts `TELESCOPE_TIMED_GUIDE_*`".
@@ -560,6 +676,9 @@ background, and the database builder was right to drop them.
   very wide field and a tight crop of the same target do not land at exactly the
   same level. Taking the median of the lower half rather than a plain median
   limits it, but does not remove it.
+- **Luminance has no survey.** DSS2 red is the stand-in in `examples/sim.toml`:
+  all-sky, sharp, and its passband contains Ha so emission nebulae actually
+  show. It is an R-band image wearing an L label, one magnitude brighter.
 - **There is no green plate.** DSS2 runs blue (468–491 nm) then jumps to red
   (640–658), so `examples/sim.toml` gives G and B the same image and only
   different anchors. PanSTARRS `g` is a genuine green-blue band, but its 99th
@@ -584,9 +703,27 @@ background, and the database builder was right to drop them.
 - **Satellite positions are TEME treated as equinox of date.** The two differ by
   the equation of the equinoxes, up to ~1.1″, which is three orders of magnitude
   below the arcminute-scale error a TLE a few days old already carries.
-- **Luminance has no survey.** DSS2 red is the stand-in in `examples/sim.toml`:
-  all-sky, sharp, and its passband contains Ha so emission nebulae actually
-  show. It is an R-band image wearing an L label, one magnitude brighter.
+- **The wind smear is spatially invariant.** One kernel for the whole frame is
+  exactly right for a translation, which is what a mount deflection is. It does
+  not model the position-dependent part: field rotation from polar misalignment,
+  and differential flexure. A corner star and a centre star smear identically
+  here, where a real badly-aligned mount elongates them differently.
+- **Wind compliance is lumped, not aerodynamic.** `response_arcsec_at_20kmh` is
+  one number standing in for sail area, drag coefficient, lever arm and
+  torsional stiffness, and `axis_ratio_ra_dec` is one number for the mount's
+  two-axis compliance. There is no wind azimuth, so pointing into the wind is no
+  worse than pointing across it, and a gust's direction is a coin toss rather
+  than the weather's. Calibrate the constant against your own rig; it is not
+  predictive from a specification.
+- **Both cameras see the same deflection.** Correct for an off-axis guider, which
+  shares the tube. Wrong for a separate guide scope, which flexes on its own
+  rings — differential flexure under gusts is a well-known way to lose a night
+  and is not modelled, so guiding here can always in principle chase the shake
+  the imaging chip actually sees.
+- **The smear cannot recover flux from outside the sensor.** Wind pulls light in
+  from beyond the frame edge, and a convolution over the rendered array has
+  nothing there to pull; the frame is edge-replicated before convolving, which
+  avoids a dark border but does not invent the stars that should have drifted in.
 
 ## Layout
 
@@ -604,7 +741,8 @@ src/astroskysim/
              trails.py      SGP4, illumination, the swept PSF
   sources/   artificial | dss | composite, behind one interface
   rig.py     all physical state and the simulation step
-  devices/   mount, camera, focuser, rotator, filterwheel
+  wind.py    gust weather, the mount's ring-down, the deflection history
+  devices/   mount, camera, focuser, rotator, filterwheel, weather
              pulse.py       TELESCOPE_TIMED_GUIDE_*, shared by every ST4 device
   cli.py
 ```

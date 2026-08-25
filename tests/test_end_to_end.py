@@ -1089,3 +1089,156 @@ async def test_a_slow_readout_neither_stops_the_clock_nor_blocks_a_client():
         # ...and the simulated clock kept up with wall clock through it.
         assert sim > 0.85 * real, f"simulated {sim:.2f} s of {real:.2f} s real"
         await c.close()
+
+
+# --------------------------------------------------------------------------
+# Weather.
+#
+# The wind is fully simulated whether or not this device exists - the guide star
+# moves and a client's RMS spikes either way. What the device adds is the ability
+# for a client to *react*, and the property a client reads for that is
+# WEATHER_STATUS's vector state, not the readings in WEATHER_PARAMETERS. A driver
+# that publishes numbers and no status is decoration.
+#
+# Off by default, because a client's profile enumerates devices and an
+# unexpected seventh one turns up in every existing Ekos profile.
+# --------------------------------------------------------------------------
+def windy_config(**over):
+    cfg = make_config(**over)
+    cfg.server.weather = True
+    cfg.wind = cfg.wind.model_copy(
+        update=dict(
+            enabled=True,
+            speed_kmh=25.0,
+            probability=0.95,
+            gust_speed_kmh=70.0,
+            gust_probability=0.3,
+        )
+    )
+    return cfg
+
+
+async def test_the_weather_device_is_absent_unless_asked_for():
+    """Default off, so no existing profile grows a device."""
+    async with Harness(make_config()) as h:
+        c = await h.connect()
+        await c.send('<getProperties version="1.7"/>')
+        await c.pump(1.0)
+        devices = {e.device for e in c.seen if e.tag.startswith("def")}
+        assert "AstroSkySim Weather" not in devices
+        await c.close()
+
+
+async def test_the_weather_device_appears_and_reports_the_wind():
+    async with Harness(windy_config()) as h:
+        rig = h.server.rig
+        rig.wind.windy = True
+        rig.wind.speed_kmh = 25.0
+
+        c = await h.connect()
+        await c.send('<getProperties device="AstroSkySim Weather"/>')
+        await c.pump(0.5)
+
+        defs = {e.name for e in c.seen if e.tag.startswith("def")}
+        assert {"WEATHER_PARAMETERS", "WEATHER_STATUS", "WEATHER_UPDATE"} <= defs
+
+        got = {}
+        for e in c.seen:
+            if e.name == "DRIVER_INFO":
+                got[e.device] = e.child_values()["DRIVER_INTERFACE"]
+        # WEATHER is bit 7 in indiapi.h. Pinned here because the per-key style of
+        # test_driver_interface_bitmasks means a wrong value would not fail it.
+        assert got["AstroSkySim Weather"] == "128"
+
+        c.mark()
+        params = await c.until(
+            lambda e: e.name == "WEATHER_PARAMETERS" and e.tag == "setNumberVector"
+        )
+        assert float(params.child_values()["WEATHER_WIND_SPEED"]) > 0.0
+        await c.close()
+
+
+async def test_the_weather_device_does_not_claim_the_st4_bit():
+    """It must not, or the guider-interface invariant would demand pulses of it.
+
+    Exactly the mistake a copy-paste from mount.py makes.
+    """
+    async with Harness(windy_config()) as h:
+        c = await h.connect()
+        await c.send('<getProperties version="1.7"/>')
+        await c.pump(1.5)
+        for e in c.seen:
+            if e.name == "DRIVER_INFO" and e.device == "AstroSkySim Weather":
+                assert not int(e.child_values()["DRIVER_INTERFACE"]) & GUIDER_INTERFACE_BIT
+        await c.close()
+
+
+async def test_wind_past_the_threshold_raises_an_alert():
+    """The state a scheduler reads to decide whether to keep imaging."""
+    async with Harness(windy_config()) as h:
+        rig = h.server.rig
+        c = await h.connect()
+        await c.send('<getProperties device="AstroSkySim Weather"/>')
+        await c.pump(0.5)
+
+        # A limit this rig will exceed, then one it cannot.
+        rig.wind.windy, rig.wind.gusting = True, False
+        rig.wind.speed_kmh = 30.0
+        c.mark()
+        await c.send(
+            '<newNumberVector device="AstroSkySim Weather" name="WEATHER_WIND_SPEED">'
+            '<oneNumber name="MIN_OK">0</oneNumber>'
+            '<oneNumber name="MAX_OK">10</oneNumber>'
+            '<oneNumber name="PERCENT_WARNING">15</oneNumber></newNumberVector>'
+        )
+        alert = await c.until(
+            lambda e: e.name == "WEATHER_STATUS" and e.get("state") == "Alert"
+        )
+        assert alert is not None
+
+        c.mark()
+        await c.send(
+            '<newNumberVector device="AstroSkySim Weather" name="WEATHER_WIND_SPEED">'
+            '<oneNumber name="MIN_OK">0</oneNumber>'
+            '<oneNumber name="MAX_OK">200</oneNumber>'
+            '<oneNumber name="PERCENT_WARNING">15</oneNumber></newNumberVector>'
+        )
+        ok = await c.until(lambda e: e.name == "WEATHER_STATUS" and e.get("state") == "Ok")
+        assert ok is not None
+        await c.close()
+
+
+async def test_a_wind_smeared_sub_records_it_in_the_header():
+    """Ground truth, for the same reason NSATS exists.
+
+    A client looking at streaked stars cannot otherwise tell wind from a bad
+    guide star or a slipped clutch.
+    """
+    cfg = windy_config(**{"telescope.focal_length_mm": 2000.0})
+    cfg.wind = cfg.wind.model_copy(update=dict(response_arcsec_at_20kmh=4.0))
+    async with Harness(cfg) as h:
+        rig = h.server.rig
+        rig.wind.windy = True
+        rig.wind.speed_kmh = 25.0
+        # Give the model a history to smear over before the shutter opens.
+        for _ in range(400):
+            rig.wind.step(0.02)
+
+        c = await h.connect()
+        await c.send('<getProperties device="AstroSkySim CCD"/>')
+        await c.pump(0.4)
+        await c.send('<enableBLOB device="AstroSkySim CCD">Also</enableBLOB>')
+        c.mark()
+        await c.send(
+            '<newNumberVector device="AstroSkySim CCD" name="CCD_EXPOSURE">'
+            '<oneNumber name="CCD_EXPOSURE_VALUE">1.0</oneNumber></newNumberVector>'
+        )
+        blob = await c.until(lambda e: e.tag == "setBLOBVector")
+        import base64
+
+        with fits.open(io.BytesIO(base64.b64decode(blob.children[0].text))) as hdul:
+            header = hdul[0].header
+            assert header["WINDKMH"] > 0.0
+            assert "GUSTKMH" in header
+            assert "SMEARPX" in header
+        await c.close()

@@ -35,6 +35,10 @@ CCD_INTERFACE = 1 << 1
 GUIDER_INTERFACE = 1 << 2
 FOCUSER_INTERFACE = 1 << 3
 FILTER_INTERFACE = 1 << 4
+#: Between FILTER and ROTATOR the header runs DOME (5), GPS (6), WEATHER (7),
+#: AO (8), DUSTCAP (9), LIGHTBOX (10), DETECTOR (11) - which is what puts ROTATOR
+#: on bit 12 and so confirms the ordering.
+WEATHER_INTERFACE = 1 << 7
 ROTATOR_INTERFACE = 1 << 12
 
 WriteHandler = Callable[[Vector, dict[str, str]], Coroutine[Any, Any, None]]

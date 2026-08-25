@@ -511,6 +511,17 @@ class CameraBase(Device):
             # Ground truth for whatever the client does about trails: a rejection
             # stack has no other way to know whether a frame really had one.
             h["NSATS"] = (cam.last_satellites, "satellite trails simulated in this frame")
+        if self.rig.wind is not None:
+            # Same reasoning as NSATS: a client looking at a sub with streaked
+            # stars cannot otherwise tell wind from a bad guide star or a slipped
+            # clutch. SMEARPX is in unbinned sensor pixels, because the smear is
+            # applied before subframing and binning.
+            h["WINDKMH"] = (round(cam.last_wind_kmh, 2), "[km/h] simulated sustained wind")
+            h["GUSTKMH"] = (round(cam.last_gust_kmh, 2), "[km/h] simulated wind gust")
+            h["SMEARPX"] = (
+                round(cam.last_smear_px, 3),
+                "[px] peak-to-peak wind smear, unbinned",
+            )
         # numpy row 0 is the bottom row of the FITS image.
         h["ROWORDER"] = "BOTTOM-UP"
         if s.bayer != "MONO":

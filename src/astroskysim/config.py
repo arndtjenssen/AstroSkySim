@@ -148,6 +148,135 @@ class MountConfig(BaseModel):
     park_dec_deg: float = 90.0
 
 
+#: Sub-step of the wind integrator, seconds. Fixed rather than tied to the tick,
+#: because the mount's ring-down is a few Hz and the tick is 10 Hz: sampling the
+#: oscillator at the tick rate would alias the ringing into a slow wobble. Also
+#: the aliasing bound behind ``WindConfig.resonance_hz``'s ceiling.
+WIND_DT_SUB = 1.0 / 128.0
+
+
+class WindConfig(BaseModel):
+    """Wind, gusts, and the mid-exposure smear they leave in a sub.
+
+    Without a dome the rig is exposed. Wind pushes the tube - continuously, and
+    in gusts - and the mount deflects. Two things follow, and both are what this
+    section exists to produce:
+
+    * The guide star moves, so a client's guider sees spikes and fights them.
+      Sustained push gets guided out with a lag; the ring-down after a gust is
+      above any guider's correction bandwidth and does not.
+    * The shift happens *while the shutter is open*, so the star is not a
+      displaced disc - it is a streak, a smear or a V, depending on where in the
+      exposure the gust landed and how the mount rang down afterwards.
+
+    The dependence on focal length needs no parameter: the deflection is angular,
+    and the plate scale turns it into pixels. On 3.76 um pixels the same 1.5"
+    shake is 0.8 px at 400 mm and 3.9 px at 2000 mm.
+    """
+
+    #: Off by default, and that is load-bearing rather than cautious: every
+    #: measured number in the test suite was taken against a still sky, so a
+    #: default of ``true`` would move every frame in every existing test.
+    enabled: bool = False
+
+    # -- the weather -------------------------------------------------------
+    #: Mean sustained speed while it is actually blowing, km/h.
+    speed_kmh: float = Field(12.0, ge=0)
+    #: Fraction of the session that is windy at all. The calm/windy gate is a
+    #: two-state Markov chain, so the off-rate is ``duration_s * (1 - p) / p``
+    #: and ``p = 1.0`` would divide by zero - hence ``lt``, rather than a
+    #: special case for "always windy".
+    probability: float = Field(0.4, ge=0.0, lt=1.0)
+    #: Mean length of one windy spell, seconds.
+    duration_s: float = Field(120.0, gt=0)
+    #: Peak speed in a gust, km/h. Validated to be at least ``speed_kmh``: a
+    #: gust that is slower than the wind it interrupts is a lull, and the model
+    #: would quietly render the opposite of what the name says.
+    gust_speed_kmh: float = Field(35.0, ge=0)
+    #: Fraction of a *windy* spell spent gusting. Gusts do not fire on a
+    #: dead-calm night.
+    gust_probability: float = Field(0.15, ge=0.0, lt=1.0)
+    #: Mean gust length, seconds. Short next to ``duration_s`` by nature.
+    gust_duration_s: float = Field(2.5, gt=0)
+
+    # -- how the mount answers --------------------------------------------
+    #: Deflection in arcsec at a sustained 20 km/h, scaling as v^2 because
+    #: aerodynamic pressure does.
+    #:
+    #: This is a **lumped** compliance: sail area, drag coefficient, lever arm
+    #: and torsional stiffness collapsed into one number, because four of those
+    #: five are unknowable for a real rig and would become fudge factors with
+    #: units. Calibrate it against what the rig actually does in a breeze.
+    #:
+    #: The unit trap is arcsec-versus-pixels. 1.2" is under a pixel on a short
+    #: refractor (1.94"/px at 400 mm) and over three on an SCT (0.39"/px at
+    #: 2000 mm), so the same number is invisible on one rig and ruins subs on
+    #: another. ``build_rig`` logs the pixel equivalent at startup.
+    response_arcsec_at_20kmh: float = Field(1.2, ge=0)
+    #: Ring-down frequency of the tube on the mount, Hz. **This is what makes
+    #: the V-shapes**: a gust is a step, and a step into a lightly damped
+    #: oscillator overshoots and rings rather than settling.
+    #:
+    #: The ceiling is enforced in ``_bounds`` rather than with an ``le`` here, so
+    #: the error can say *why* 40 Hz is refused. A bare "less than or equal to
+    #: 16" reads as an arbitrary limit; it is in fact the point past which the
+    #: integrator aliases the ring-down into a slow wobble.
+    resonance_hz: float = Field(4.0, gt=0)
+    #: Damping ratio of that ring-down. Bounded **below 1 on purpose**: at
+    #: zeta >= 1 the mount is critically or over-damped, so there is no
+    #: overshoot, no ringing and no V-shape, and the whole feature silently
+    #: degrades to a slow pointing offset with nothing in the log to say so.
+    #: A tube on a mount is 0.03-0.15.
+    damping: float = Field(0.15, gt=0, lt=1.0)
+    #: How the deflection splits across the mechanical axes, RA:Dec. RA is the
+    #: softer axis - it is the driven one, fighting the worm - which is why wind
+    #: spikes land mostly in RA on real guide logs.
+    #:
+    #: The name alone does not say whether this is an amplitude or a power
+    #: ratio, so: it is amplitude, and the split preserves the vector
+    #: magnitude. ``theta_ra = theta * r / sqrt(1 + r**2)`` and
+    #: ``theta_dec = theta / sqrt(1 + r**2)``.
+    axis_ratio_ra_dec: float = Field(1.5, gt=0)
+    #: High-frequency buffeting, as a fraction of the steady push. Without it
+    #: the trace between gusts is unnaturally clean.
+    buffet_fraction: float = Field(0.25, ge=0)
+
+    # -- bookkeeping -------------------------------------------------------
+    #: Seconds of deflection history retained, which is what bounds the longest
+    #: exposure that can be smeared correctly. The smear is built *after* the
+    #: shutter closed, so this has to cover the exposure plus however long the
+    #: frame sat in the readout queue - hence the slack over a 600 s sub.
+    #: At 128 Hz, 900 s is ~115k samples in two float32 columns, under a MB.
+    history_s: float = Field(900.0, gt=0, le=7200.0)
+
+    @model_validator(mode="after")
+    def _bounds(self) -> WindConfig:
+        if self.gust_speed_kmh < self.speed_kmh:
+            raise ValueError(
+                f"wind.gust_speed_kmh ({self.gust_speed_kmh:g}) is below "
+                f"wind.speed_kmh ({self.speed_kmh:g}); a gust slower than the "
+                "sustained wind is a lull, not a gust"
+            )
+        # Nyquist is 64 Hz here, but a straight-line path between samples needs
+        # far more than two per cycle before a ring-down stops looking like a
+        # polygon. Eight is the point where the V's tips survive.
+        limit = 1.0 / (8.0 * WIND_DT_SUB)
+        if self.resonance_hz > limit:
+            raise ValueError(
+                f"wind.resonance_hz ({self.resonance_hz:g}) exceeds {limit:g} Hz, "
+                f"the most the {1 / WIND_DT_SUB:g} Hz integrator can represent "
+                "without aliasing the ring-down"
+            )
+        return self
+
+    @property
+    def axis_weights(self) -> tuple[float, float]:
+        """RA and Dec shares of a deflection, preserving its magnitude."""
+        r = self.axis_ratio_ra_dec
+        norm = (1.0 + r * r) ** 0.5
+        return r / norm, 1.0 / norm
+
+
 class Optics(BaseModel):
     seeing_arcsec: float = Field(2.5, gt=0)
     #: Sky brightness in mag/arcsec^2 - an SQM reading. Converted to e-/px/s
@@ -334,6 +463,13 @@ class ServerConfig(BaseModel):
     focuser: bool = True
     rotator: bool = True
     filter_wheel: bool = True
+    #: The weather station, reporting ``[wind]``. Off by default, and not for
+    #: caution: a client's profile enumerates devices, so defaulting this on
+    #: would add an unexpected seventh device to every existing Ekos profile.
+    #: Deliberately *not* derived from ``wind.enabled`` - two sources of truth
+    #: for one switch is how a device ends up half-present. ``build_rig`` logs a
+    #: pointer when the wind is blowing and nothing is reporting it.
+    weather: bool = False
 
 
 class Config(BaseModel):
@@ -350,6 +486,8 @@ class Config(BaseModel):
     rotator: Rotator = Field(default_factory=Rotator)
     filter_wheel: FilterWheel = Field(default_factory=FilterWheel)
     mount: MountConfig = Field(default_factory=MountConfig)
+    #: Wind, gusts, and the mid-exposure smear they leave. Off by default.
+    wind: WindConfig = Field(default_factory=WindConfig)
     optics: Optics = Field(default_factory=Optics)
     source: SourceConfig = Field(default_factory=SourceConfig)
     #: Where the shared satellite configuration lives, and whether to use it.

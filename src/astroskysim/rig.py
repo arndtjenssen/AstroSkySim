@@ -27,14 +27,17 @@ from .sky.render import (
     add_hot_pixels,
     add_sky_and_noise,
     apply_bayer,
+    apply_smear,
     bin_frame,
     hfd_from_focus,
+    smear_kernel,
     subframe,
     surface_brightness_to_electrons,
     to_adu,
 )
 from .sky.wcs import fast_lst_deg, fast_radec_to_altaz, sensor_wcs
 from .sources.base import RenderContext
+from .wind import build_wind_model, path_to_pixels
 
 log = logging.getLogger("astroskysim.rig")
 
@@ -142,6 +145,14 @@ class CameraState:
     start_jd: float = 0.0
     #: Satellites that reached the sensor in the last frame, for the header.
     last_satellites: int = 0
+    #: Peak-to-peak wind smear of the last frame in *unbinned sensor* pixels -
+    #: the smear runs before ``subframe`` and ``bin_frame``, so it is not in
+    #: delivered pixels - and the wind that produced it. Ground truth for the
+    #: header: a client inspecting a ruined sub has no other way to know whether
+    #: it was wind.
+    last_smear_px: float = 0.0
+    last_wind_kmh: float = 0.0
+    last_gust_kmh: float = 0.0
     #: Bumped whenever a new frame lands, so devices can detect staleness.
     sequence: int = 0
 
@@ -173,6 +184,12 @@ class Rig:
         #: no satellites - switched off, nothing fetched, extra not installed -
         #: so the imaging path only ever asks whether it is there.
         self.satellites = None
+        #: ``WindModel`` or None when ``[wind]`` is off. Built here rather than
+        #: injected by ``build_rig`` like ``source`` and ``satellites``, because
+        #: ``wind`` imports only from ``config`` so there is no cycle to break -
+        #: and a bare ``Rig(cfg)`` in a test then has weather like any other
+        #: physics.
+        self.wind = build_wind_model(c)
 
         self.focuser.position = float(c.focuser.perfect_focus)
         self.focuser.target = self.focuser.position
@@ -230,6 +247,24 @@ class Rig:
         sync moves what the mount *claims* without moving the optics, so the
         correction it books has to come back off here.
         """
+        return self.pointing_at()
+
+    def pointing_at(self, wind_offset: tuple[float, float] | None = None):
+        """``actual_pointing``, optionally with the wind term supplied.
+
+        ``wind_offset`` is arcsec, ``(RA great-circle, Dec)``. ``None`` means
+        "use the wind as it is right now", which is what every caller outside
+        ``capture`` wants.
+
+        ``capture`` supplies the *exposure window's mean* instead, and the
+        distinction is not cosmetic. ``capture`` runs in the readout thread after
+        the shutter closed - minutes later on a long sub - so the instantaneous
+        offset it would otherwise read is a sample from outside the window
+        entirely, while the smear kernel is zero-mean about the window mean. The
+        frame would translate by the difference, which for a gust is the whole
+        amplitude. Worse, the tick keeps stepping the wind during ``capture``, so
+        the two would not even be reading the same value.
+        """
         m = self.cfg.mount
         ra = self.mount.ra_deg - self.mount.sync_offset_ra
         dec = self.mount.dec_deg - self.mount.sync_offset_dec
@@ -252,6 +287,23 @@ class Rig:
             dec += (m.elevation_error / 60.0) * np.cos(ha)
             ra += (m.azimuth_error / 60.0) * np.sin(ha) / max(np.cos(np.deg2rad(dec)), 1e-3)
 
+        # Wind. Deliberately in the same gap as the terms above: the guide camera
+        # images actual_pointing, so a gust throws the guide star, the client
+        # corrects it, and the pulse moves mount.ra_deg - shifting reported and
+        # actual together. Sustained push therefore gets guided out with a lag
+        # and the ring-down does not, which is the real behaviour and needs no
+        # special case. Nothing here computes an RMS; the client's RMS is the
+        # consequence.
+        if wind_offset is None and self.wind is not None:
+            wind_offset = self.wind.deflection
+        if wind_offset is not None:
+            d_ra, d_dec = wind_offset
+            # The only cos(dec) in the feature: great-circle arcsec to RA
+            # degrees, exactly as the three terms above do it. path_to_pixels
+            # must not repeat it.
+            ra += d_ra / 3600.0 / max(np.cos(np.deg2rad(dec)), 1e-3)
+            dec += d_dec / 3600.0
+
         if not self.mount.tracking and not self.mount.slewing:
             # Tracking off: the sky drifts through the field.
             ra -= SIDEREAL_DEG_S * self._untracked_s
@@ -260,9 +312,21 @@ class Rig:
 
     _untracked_s: float = 0.0
 
+    def wind_time(self, jd: float) -> float:
+        """Wind-model time for a JD, in seconds since the run started.
+
+        ``jd = _start_jd + elapsed_s / 86400``, and the wind model's clock tracks
+        ``elapsed_s``, so this inverts the one to index the other. Keeps the
+        exposure window off ``CameraState``, which already records the start as a
+        JD for the satellite trails.
+        """
+        return (jd - self._start_jd) * 86400.0
+
     # -- simulation --------------------------------------------------------
     async def step(self, dt: float) -> None:
         self.elapsed_s += dt
+        if self.wind is not None:
+            self.wind.step(dt)
         self._step_mount(dt)
         self._step_focuser(dt)
         self._step_rotator(dt)
@@ -567,8 +631,14 @@ class Rig:
             return float("inf")
         return float(-2.5 * np.log10(e_px_s / unit))
 
-    def build_wcs(self, width: int, height: int, scale_arcsec_px: float | None = None):
-        ra, dec = self.actual_pointing
+    def build_wcs(
+        self,
+        width: int,
+        height: int,
+        scale_arcsec_px: float | None = None,
+        wind_offset: tuple[float, float] | None = None,
+    ):
+        ra, dec = self.pointing_at(wind_offset)
         return sensor_wcs(
             ra,
             dec,
@@ -616,16 +686,73 @@ class Rig:
         cam.last_satellites = len(drawn)
         return electrons + trails
 
+    def exposure_window(self, cam: CameraState):
+        """The wind's deflection over this exposure, or None.
+
+        Anchored on ``cam.start_jd`` rather than on now, for the reason
+        ``add_satellite_trails`` gives: the readout runs in a thread and can
+        begin minutes after the shutter opened.
+        """
+        if self.wind is None or cam.exposure_s <= 0 or cam.frame_type != 0:
+            return None
+        start_jd = cam.start_jd or (self.jd - cam.exposure_s / 86400.0)
+        return self.wind.window(self.wind_time(start_jd), cam.exposure_s)
+
+    def apply_wind_smear(self, cam: CameraState, electrons: np.ndarray, wcs, window):
+        """Smear an already-rendered frame along the wind's path.
+
+        One kernel for the whole frame, which is exactly right for a
+        translation: wind deflection moves every star in the field together, so
+        stars, survey nebulosity and any satellite trail all smear as one. That
+        also makes this the wrong place for anything position-dependent - field
+        rotation and differential flexure are not modelled here.
+
+        Placement in ``capture`` is load-bearing in three directions. Before
+        ``apply_bayer``, because a real CFA samples a smeared *scene* rather than
+        smearing an already-attenuated mosaic. Before ``add_sky_and_noise``,
+        because convolving read noise would correlate it and leave the frame
+        smoother than the sensor is. After ``add_satellite_trails``, because a
+        trail shakes with the tube too - and because it puts this downstream of
+        the composite path's ``suppress_point_sources``, which would otherwise
+        erase the streak.
+
+        Light frames only, like the trails: a wind smear on a flat is a no-op
+        except at the border, and on a bias there is nothing to smear.
+        """
+        cam.last_smear_px = 0.0
+        if window is None or len(window) < 2:
+            return electrons
+        dx, dy = path_to_pixels(wcs, window.d_ra, window.d_dec)
+        kernel = smear_kernel(dx, dy)
+        if kernel is None:
+            return electrons
+        cam.last_smear_px = float(max(np.ptp(dx), np.ptp(dy)))
+        return apply_smear(electrons, kernel)
+
     def capture(self, cam: CameraState) -> np.ndarray:
         """Produce one frame in ADU, honouring binning, subframe and type."""
         s = self.sensor_cfg(cam)
-        full_wcs = self.build_wcs(s.width_px, s.height_px, self.scale_arcsec_px(cam))
+        # The window is taken *once* and handed to both consumers. The WCS gets
+        # its mean, the kernel gets the zero-mean path about that mean, so the
+        # smear spreads a star without translating it and a plate solve of a
+        # wind-ruined sub still returns the true centre. Re-reading the wind for
+        # either one reintroduces both a bias and a race - see pointing_at.
+        window = self.exposure_window(cam)
+        full_wcs = self.build_wcs(
+            s.width_px,
+            s.height_px,
+            self.scale_arcsec_px(cam),
+            wind_offset=None if window is None else window.mean,
+        )
         optics = self.build_optics(cam)
         sky_e_s = self.sky_e_s(cam)
         # Every read of actual_pointing redraws the tracking noise, so the
         # header has to reuse *this* WCS rather than build a second one that
         # disagrees with the pixels by the noise amplitude.
         cam.last_wcs = full_wcs
+        if self.wind is not None:
+            cam.last_wind_kmh = self.wind.speed_kmh
+            cam.last_gust_kmh = self.wind.reported_gust_kmh
 
         dark = cam.frame_type in (1, 2)  # bias or dark
         if dark or self.source is None:
@@ -651,6 +778,7 @@ class Rig:
                 electrons = np.full_like(electrons, 0.4 * s.well_depth_e)
 
         electrons = self.add_satellite_trails(cam, electrons, full_wcs, optics)
+        electrons = self.apply_wind_smear(cam, electrons, full_wcs, window)
         electrons = apply_bayer(electrons, s.bayer)
         sensor = self.sensor_model(cam)
         electrons = add_sky_and_noise(
@@ -715,6 +843,30 @@ def build_rig(cfg: Config) -> Rig:
             "no [sensor_guide_cam] section: the guide camera reports the imaging "
             "sensor's specs, which no real rig does"
         )
+    if rig.wind is not None:
+        w = cfg.wind
+        # The arcsec-to-pixel step is the whole unit trap in this section, so it
+        # is logged rather than left to be discovered in a ruined sub.
+        sustained = w.response_arcsec_at_20kmh * (w.speed_kmh / 20.0) ** 2
+        gust = w.response_arcsec_at_20kmh * (w.gust_speed_kmh / 20.0) ** 2
+        log.info(
+            "wind on: %.0f km/h sustained (%.2f\" = %.1f px imaging, %.1f px guiding), "
+            "gusts to %.0f km/h (%.2f\" = %.1f px), ringing at %.1f Hz zeta %.2f",
+            w.speed_kmh,
+            sustained,
+            sustained / cfg.scale_arcsec_px,
+            sustained / cfg.guide_scale_arcsec_px,
+            w.gust_speed_kmh,
+            gust,
+            gust / cfg.scale_arcsec_px,
+            w.resonance_hz,
+            w.damping,
+        )
+        if not cfg.server.weather:
+            log.info(
+                "no weather device is advertised, so no client can see the wind or "
+                "react to it; set server.weather = true to expose it"
+            )
     if cfg.optics.sky_background is not None:
         # The unit is the trap: a value near 21 reads as an SQM figure and is
         # in fact about fifty times the electron rate an SQM 21 sky produces.
