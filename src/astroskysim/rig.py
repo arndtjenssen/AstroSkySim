@@ -37,6 +37,7 @@ from .sky.render import (
 )
 from .sky.wcs import fast_lst_deg, fast_radec_to_altaz, sensor_wcs
 from .sources.base import RenderContext
+from .temperature import build_temperature_model
 from .wind import build_wind_model, path_to_pixels
 
 log = logging.getLogger("astroskysim.rig")
@@ -153,6 +154,14 @@ class CameraState:
     last_smear_px: float = 0.0
     last_wind_kmh: float = 0.0
     last_gust_kmh: float = 0.0
+    #: Ambient and optics temperature, and the focus drift in steps, as they
+    #: stood when this frame was rendered. Snapshotted for the same reason the
+    #: wind fields above are: the tick keeps stepping the model during a
+    #: multi-second readout, so ``_to_fits`` re-reading it would describe a
+    #: different moment than the pixels do.
+    last_air_c: float = 0.0
+    last_optics_c: float = 0.0
+    last_focus_drift: float = 0.0
     #: Bumped whenever a new frame lands, so devices can detect staleness.
     sequence: int = 0
 
@@ -190,6 +199,11 @@ class Rig:
         #: and a bare ``Rig(cfg)`` in a test then has weather like any other
         #: physics.
         self.wind = build_wind_model(c)
+        #: ``TemperatureModel`` or None when ``[temperature]`` is off. Built here
+        #: for the same reason as ``wind``: it imports only from ``config``, so
+        #: there is no cycle to break and a bare ``Rig(cfg)`` in a test cools
+        #: through the night like any other physics.
+        self.temperature = build_temperature_model(c)
 
         self.focuser.position = float(c.focuser.perfect_focus)
         self.focuser.target = self.focuser.position
@@ -327,11 +341,15 @@ class Rig:
         self.elapsed_s += dt
         if self.wind is not None:
             self.wind.step(dt)
+        # Before the focuser, so a compensating move made this tick is against
+        # the temperature this tick actually has.
+        if self.temperature is not None:
+            self.temperature.step(dt)
         self._step_mount(dt)
         self._step_focuser(dt)
         self._step_rotator(dt)
         self._step_filter(dt)
-        self._step_temperature(dt)
+        self._step_cooler(dt)
 
     def _step_mount(self, dt: float) -> None:
         m, cfg = self.mount, self.cfg.mount
@@ -434,7 +452,8 @@ class Rig:
             if self.filter.remaining_s == 0:
                 self.filter.slot = self.filter.target
 
-    def _step_temperature(self, dt: float) -> None:
+    def _step_cooler(self, dt: float) -> None:
+        """Sensor cooling. Not the ambient temperature - that is ``self.temperature``."""
         for cam in (self.camera, self.guider):
             target = cam.set_temperature if cam.cooler_on else 20.0
             # First-order approach, ~30 s time constant.
@@ -509,11 +528,22 @@ class Rig:
             a = -a
         return (a + self.cfg.rotator.mechanical_offset) % 360.0
 
+    @property
+    def focus_drift_steps(self) -> float:
+        """Steps the focus point has moved from thermal expansion.
+
+        Zero when ``[temperature]`` is off, which is the only reason anything
+        downstream can add it unconditionally.
+        """
+        if self.temperature is None:
+            return 0.0
+        return self.temperature.focus_drift_steps(self.cfg.focuser.step_size_um)
+
     def current_hfd(self) -> float:
         """HFD in pixels at the current focus, including the filter offset."""
         offsets = self.cfg.filter_wheel.focus_offsets
         idx = max(0, min(self.filter.slot - 1, len(offsets) - 1))
-        perfect = self.cfg.focuser.perfect_focus + offsets[idx]
+        perfect = self.cfg.focuser.perfect_focus + offsets[idx] + self.focus_drift_steps
         return hfd_from_focus(self.focuser.position, perfect, self.cfg.focuser.focus_range)
 
     def guide_hfd(self) -> float:
@@ -532,13 +562,18 @@ class Rig:
 
         A separate guide scope instead carries its own fixed focus, untouched by
         the imaging focuser: set ``optics.guide_hfd_px`` for that rig.
+
+        Thermal drift *is* included, unlike the filter offset. The tube expands
+        upstream of everything in the train, so an off-axis guider goes soft with
+        the imaging chip as the night cools - and a pinned ``guide_hfd_px`` is
+        correctly immune, because that rig's guide scope holds its own focus.
         """
         fixed = self.cfg.optics.guide_hfd_px
         if fixed is not None:
             return fixed
         return hfd_from_focus(
             self.focuser.position,
-            self.cfg.focuser.perfect_focus,
+            self.cfg.focuser.perfect_focus + self.focus_drift_steps,
             self.cfg.focuser.focus_range,
         )
 
@@ -753,6 +788,10 @@ class Rig:
         if self.wind is not None:
             cam.last_wind_kmh = self.wind.speed_kmh
             cam.last_gust_kmh = self.wind.reported_gust_kmh
+        if self.temperature is not None:
+            cam.last_air_c = self.temperature.air_c
+            cam.last_optics_c = self.temperature.optics_c
+            cam.last_focus_drift = self.focus_drift_steps
 
         dark = cam.frame_type in (1, 2)  # bias or dark
         if dark or self.source is None:
@@ -866,6 +905,40 @@ def build_rig(cfg: Config) -> Rig:
             log.info(
                 "no weather device is advertised, so no client can see the wind or "
                 "react to it; set server.weather = true to expose it"
+            )
+    if rig.temperature is not None:
+        t = cfg.temperature
+        # The unit trap here is um/K against this rig's focus_range, not against
+        # a real critical focus zone. The same 20 um/K is a rounding error on a
+        # loose focus_range and ruins the night on a tight one, so the number
+        # that actually says whether the config does anything is the HFD.
+        steps_per_c = t.focus_shift_um_per_c / cfg.focuser.step_size_um
+        drift = steps_per_c * t.night_drop_c
+        end_hfd = hfd_from_focus(0.0, drift, cfg.focuser.focus_range)
+        log.info(
+            "temperature on: %.1f C falling %.1f C over the night (tau %.1f h), "
+            "%.3g um/K = %.3g steps/K, so a full night's cooling is %.0f steps "
+            "and takes HFD %.2f -> %.2f uncorrected",
+            t.start_c,
+            t.night_drop_c,
+            t.tau_hours,
+            t.focus_shift_um_per_c,
+            steps_per_c,
+            drift,
+            hfd_from_focus(0.0, 0.0, cfg.focuser.focus_range),
+            end_hfd,
+        )
+        log.info(
+            "the optics lag the air by %.0f min and the focuser probe by %.0f min, "
+            "so temperature compensation against FOCUS_TEMPERATURE cannot fully "
+            "track the drift - that gap is deliberate",
+            t.optics_tau_s / 60.0,
+            t.probe_tau_s / 60.0,
+        )
+        if not cfg.server.weather:
+            log.info(
+                "no weather device is advertised, so no client can see the "
+                "temperature; set server.weather = true to expose it"
             )
     if cfg.optics.sky_background is not None:
         # The unit is the trap: a value near 21 reads as an SQM figure and is

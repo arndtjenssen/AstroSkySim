@@ -4,7 +4,7 @@ Headless INDI simulator for a full astrophotography rig: mount, imaging camera,
 guide camera, focuser, rotator, filter wheel and an optional weather station. Something to play with when
 the weather is bad and one needs to stay at home.
 
-Serves INDI on port 7625 — no GUI, no desktop application. Image sources are either artificial (from local star catalog), online surveys or a composite of both. Satellite streak simulation can be added optionally by downloading satellite databases. Wind and gusts can be simulated too, including the mid-exposure star trailing they cause.
+Serves INDI on port 7625 — no GUI, no desktop application. Image sources are either artificial (from local star catalog), online surveys or a composite of both. Satellite streak simulation can be added optionally by downloading satellite databases. Wind and gusts can be simulated too, including the mid-exposure star trailing they cause, and so can a night's temperature drop and the focus drift it puts into a sequence.
 
 AstroSkySim follows in the footsteps of Han Kleijn's
 [Sky Simulator for Ascom and Alpaca](https://sourceforge.net/projects/sky-simulator),
@@ -449,6 +449,128 @@ take the taps (7 taps, 0.061 s) and large ones the FFT, crossing over around 16.
 A 2 s guide frame costs ~0.015 s. Sub-pixel smears are skipped outright, so a
 calm night is free.
 
+## Temperature and focus drift
+
+A night cools. Dusk to dawn is 5–15 K at a lowland site, with warm and cold air
+masses passing over on top of that, and focus follows: the tube lengthens and
+shortens and the glass changes index. That is 15–25 µm/K on an aluminium-tube
+refractor and 150–350 µm/K on a Schmidt-Cassegrain, where the secondary amplifies
+the primary-to-secondary spacing change by m² ≈ 25. So an autofocus run goes
+stale, and the staler it gets the softer the subs.
+
+```toml
+[server]
+weather = true          # else nothing reports the temperature to a client
+
+[temperature]
+enabled = true
+start_c = 16.0                  # ambient when the session opens
+night_drop_c = 10.0             # total fall toward the asymptote
+tau_hours = 5.0                 # measured range is 3-8 h
+hours_into_night = 0.0          # 3.0 opens most of the way down the curve
+spell_amplitude_c = 2.5         # signed, so warm spells as well as cold
+spell_probability = 0.25        # fraction of the session inside a spell
+spell_duration_s = 900.0
+spell_ramp_s = 180.0            # air does not step
+sigma_c = 0.15                  # background wander
+noise_tau_s = 300.0
+optics_tau_s = 2400.0           # how far the optics lag the air
+probe_tau_s = 300.0             # how far the focuser's probe lags it
+focus_shift_um_per_c = 20.0     # signed; + means cooling racks out
+# reference_c = 16.0            # where perfect_focus really is perfect
+```
+
+Off by default. Every measured HFD in the test suite was taken at a fixed focus,
+so a default of `true` would drift all of them at once.
+
+### Three temperatures, and the gap between them is the feature
+
+This is the thermal analogue of `mount.ra_deg` versus `actual_pointing`. Three
+numbers, and only one of them sets focus:
+
+| number | lag | who sees it |
+| --- | --- | --- |
+| `air_c` | none | `WEATHER_TEMPERATURE` |
+| `probe_c` | short (`probe_tau_s`) | `FOCUS_TEMPERATURE` — a sensor on the focuser body |
+| `optics_c` | long (`optics_tau_s`) | nothing, except the FITS header |
+
+A client that calibrates `focuser.temp_coeff` against the probe and compensates
+perfectly *still* drifts, because focus follows the optics. That is not a
+simplification artefact — it is the real failure, and the most commonly
+misdiagnosed one: a ZWO EAF's sensor sits at the focuser, in the airflow, which
+is why reported coefficients for nominally identical rigs scatter from 20 to over
+100 steps/K, while an Optec TCF-SI probe strapped mid-tube calibrates
+reproducibly. Set `probe_tau_s = optics_tau_s` to model that second rig.
+
+Driving focus from `air_c` instead collapses all three into one, and a correct
+coefficient then works perfectly — leaving the feature with nothing to test a
+client against.
+
+`focuser.temp_coeff` and `temperature.focus_shift_um_per_c` are deliberately two
+numbers. One is the correction the client applies, the other is the error the
+telescope actually commits. `focus_shift_um_per_c / focuser.step_size_um` is the
+perfectly calibrated coefficient, and it is worth setting it wrong on purpose.
+
+### How much focus a degree costs
+
+`focus_shift_um_per_c` is **one lumped constant**, standing in for tube CTE,
+glass dn/dT and secondary amplification together — the same choice as
+`wind.response_arcsec_at_20kmh`, and for the same reason. It is deliberately not
+derived from a tube-material setting: the Cassegrain amplification is m², and m
+runs 1.5–5 across designs, so a single "cassegrain" constant would be wrong for
+most rigs.
+
+| tube | µm/K | basis |
+| --- | --- | --- |
+| Refractor, aluminium | 15–25 | measured; CTE 23 ppm/K × focal length |
+| Refractor, carbon | 5–12 | inference — the tube term vanishes, the glass remains |
+| Newtonian, aluminium | 20–25 | CTE × focal length, no amplification |
+| Newtonian, steel / carbon | 10–13 / 2–6 | CTE 12 / ~0–1 ppm/K |
+| Maksutov | 150–300 | **inference only** — Gregory m ≈ 6, so ~36× |
+| SCT, C8 f/10 | 150–260 | three independent routes agree within ~30% |
+| SCT, C11 / C14 | ~300 / ~350 | a C14 measures 161 steps/K on a 2.16 µm step |
+
+The C8 figure is the best-supported number here: Optec's default coefficient
+(86 steps × 2.16 µm = 186), a published estimate (254), and 23 ppm/K over a
+400 mm tube amplified by 25 (230) all land in the same place. The Maksutov row is
+m² inference with no measurement behind it. The sign convention is that
+**positive means cooling racks the focuser out**, to a higher step number, which
+is the direction every measured position-versus-temperature slope reports.
+
+The unit trap is µm/K against *this rig's* `focuser.focus_range`, not against a
+real critical focus zone. The shipped `focus_range = 1000` with `step_size_um =
+1.0` is a much looser focus tolerance than a real f/5 system has, so 20 µm/K over
+a 10 K night takes HFD from 2.35 to only ~3.09 — while 200 µm/K reaches ~20.
+`astroskysim -v` logs the drift and the resulting HFD for the rig you actually
+configured, because that is the number that says whether the config does
+anything. Tighten `focus_range` for a rig that should need refocusing every half
+degree.
+
+### What the frame gets
+
+The header carries `AMBTEMP`, `OPTTEMP` and `FOCDRIFT` (steps from the reference
+position), for the same reason `NSATS` and `WINDKMH` exist — a client looking at
+a soft sub cannot otherwise tell thermal drift from bad seeing or a missed focus
+run. `OPTTEMP` is there specifically because no property publishes it.
+
+Both chips drift. The tube expands upstream of the whole train, so an off-axis
+guider's star bloats with the imaging one, by the same route that makes an
+autofocus run suspend guiding. A separate guide scope pinned with
+`optics.guide_hfd_px` holds its own focus and is correctly immune.
+
+### Cost
+
+A handful of floats per tick and no arrays at all — there is no history ring,
+unlike wind. That asymmetry is deliberate rather than an omission: wind has to be
+resolved *within* an exposure because it smears a star, but temperature moves at
+~0.3 K/h, so even an SCT at 200 µm/K drifts ~5 µm across a 300 s sub. So this is
+read once per frame at readout, like every other error term in the simulator.
+
+The cooling curve is closed-form in elapsed time and the lags use
+`1 - exp(-dt/tau)` rather than `dt/tau`, which saturates instead of overshooting.
+A stalled tick therefore lands *on* the target rather than sailing past a
+40-minute time constant and ringing.
+
 ## Devices
 
 INDI only. The property set is deliberately wide — a device that answers just
@@ -461,13 +583,14 @@ simulates is exposed:
   `TELESCOPE_PARK_POSITION`/`_OPTION`, `CONFIG_*`
 - **Filter wheel** — `FILTER_FOCUS_OFFSET` (per-filter focus offsets)
 - **Rotator** — `REL_ROTATOR_ANGLE`, `ROTATOR_MECHANICAL_ANGLE`
-- **Focuser** — `FOCUS_TEMPERATURE_COMPENSATION`, `FOCUS_BACKLASH_*`
-  (backlash is simulated physically, so a client that compensates is really tested)
+- **Focuser** — `FOCUS_TEMPERATURE`, `FOCUS_TEMPERATURE_COMPENSATION`,
+  `FOCUS_BACKLASH_*`. Backlash and thermal focus drift are both simulated
+  physically, so a client that compensates for either is really tested
 - **Camera** — `CCD_COOLER_POWER`, `CCD_READOUT_MODE`, `CCD_STOP_EXPOSURE`
   (graceful stop that keeps the frame, as distinct from abort)
-- **Weather** — `WEATHER_PARAMETERS`, `WEATHER_STATUS`, per-parameter
-  `MIN_OK`/`MAX_OK`/`PERCENT_WARNING` thresholds, `WEATHER_UPDATE`. Off by
-  default (`server.weather`)
+- **Weather** — `WEATHER_PARAMETERS` (wind, gust, temperature), `WEATHER_STATUS`,
+  per-parameter `MIN_OK`/`MAX_OK`/`PERCENT_WARNING` thresholds, `WEATHER_UPDATE`.
+  Off by default (`server.weather`)
 
 The guide camera has its own sensor spec (above) rather than a copy of the
 imaging chip's, and `TELESCOPE_INFO`'s guider fields carry the guide scope rather
@@ -724,6 +847,31 @@ background, and the database builder was right to drop them.
   from beyond the frame edge, and a convolution over the rendered array has
   nothing there to pull; the frame is edge-replicated before convolving, which
   avoids a dark border but does not invent the stars that should have drifted in.
+- **Thermal focus drift is linear in temperature.** One coefficient, applied to
+  one temperature. Some real rigs measure a quadratic relation with a stable
+  slope and a drifting zero offset, and a carbon-tube SCT has been reported
+  drifting non-monotonically with outright direction reversals. Nothing here
+  reverses direction: cool and the focus point moves one way, monotonically.
+- **The optics never sit *below* ambient.** They lag it and nothing more. Real
+  exposed surfaces radiate to a sky 25–50 K colder than the air and settle
+  *under* it, by an amount that shrinks as the wind picks up — so a *rise* in
+  ambient makes the error worse, which is the mechanism that best explains those
+  reported reversals. Radiative subcooling is not modelled, and neither is any
+  coupling between `[wind]` and `[temperature]`.
+- **The cooling curve has no dewpoint floor.** Real nocturnal cooling stalls near
+  the dewpoint as condensation releases latent heat; here it decays toward
+  `start_c - night_drop_c` whatever the humidity, because there is no humidity.
+  There is also no dew, and so nothing for a dew heater to be needed for.
+- **A separate guide scope shares the imaging tube's coefficient.** Its own tube
+  would expand at its own rate on its own rings. `optics.guide_hfd_px` pins the
+  guide HFD outright, which is the only alternative offered — there is no second
+  `focus_shift_um_per_c` for the guide train.
+- **The night is anchored on session start, not on the sun.** `hours_into_night`
+  says where in the curve to begin; nothing derives dusk from `[site]` and the
+  date. So a session left running past dawn keeps cooling, and two sessions
+  started at different clock times behave identically. This keeps the astropy
+  ephemeris out of the tick, which is the same constraint `fast_lst_deg` exists
+  for.
 
 ## Layout
 
@@ -742,6 +890,7 @@ src/astroskysim/
   sources/   artificial | dss | composite, behind one interface
   rig.py     all physical state and the simulation step
   wind.py    gust weather, the mount's ring-down, the deflection history
+  temperature.py  the night's cooling, the optics lag, the focus drift
   devices/   mount, camera, focuser, rotator, filterwheel, weather
              pulse.py       TELESCOPE_TIMED_GUIDE_*, shared by every ST4 device
   cli.py

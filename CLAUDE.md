@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 AstroSkySim (`astroskysim`) — a headless INDI server simulating a full astrophotography rig
 (mount, imaging camera, guide camera, focuser, rotator, filter wheel, and an optional weather
-station reporting the simulated wind). **INDI only: no GUI, no
+station reporting the simulated wind and temperature). **INDI only: no GUI, no
 Alpaca, no ASCOM**, and none of those are wanted. The project descends conceptually from Han
 Kleijn's "Sky Simulator for Ascom and Alpaca" — an independent implementation of the same idea,
 not a translation of it. See the Acknowledgements section of `README.md`.
@@ -361,6 +361,67 @@ safe", so a driver with readings and no status is decoration. It must not set `G
 `test_every_guider_interface_device_accepts_timed_pulses` will demand pulse properties of a weather
 station — the copy-paste-from-`mount.py` mistake.
 
+### Temperature and focus drift
+
+`temperature.py` is `TemperatureModel` (night curve → spells → three lagged temperatures → focus
+drift), built in `Rig.__post_init__` next to `wind` and stepped from `Rig.step`. Off by default:
+**every measured HFD in this file was taken at a fixed focus.** Four decisions carry it:
+
+- **Three temperatures, and the gap between them *is* the feature.** `air_c` is ambient and is what
+  `WEATHER_TEMPERATURE` reports; `probe_c` lags it slightly and is what `FOCUS_TEMPERATURE` reports;
+  `optics_c` lags a lot more, is published by nothing except the FITS `OPTTEMP` card, and is the only
+  one `focus_drift_steps` reads. This is `mount.ra_deg` versus `actual_pointing` applied to focus: a
+  client calibrating `focuser.temp_coeff` against the probe and compensating perfectly still drifts.
+  Driving focus from `air_c` collapses all three, makes a correct coefficient work exactly, and
+  deletes the feature while every test still passes. `probe_tau_s == optics_tau_s` is the mid-tube
+  probe (an Optec TCF-SI) and is the configured escape hatch, not a bug.
+- **`focus_shift_um_per_c` and `focuser.temp_coeff` are deliberately two numbers.** The first is the
+  error the telescope commits, the second the correction the client applies. Both use the sign
+  convention **positive = cooling racks out** — which is why `Focuser.step` computes
+  `(reference - temp) * temp_coeff` and not the `(temp - reference)` it had before. Real controllers
+  publish it this way (an Optec coefficient is the negative of the fitted slope, default +86 for an
+  SCT). `focus_shift_um_per_c / step_size_um` is perfect calibration. A reversed sign anywhere still
+  defocuses convincingly, so `test_cooling_racks_the_focuser_out` asserts the sign directly rather
+  than inferring it from an HFD that rose.
+- **`focuser.step_size_um` became load-bearing.** It had *no reader at all* before this and is now
+  the only thing converting µm/K into steps. `focuser.temperature` (the old fixed 12 °C) survives
+  only as the fallback both devices report when the model is off.
+- **No history ring, unlike wind.** Wind is resolved *within* an exposure because it smears a star;
+  temperature moves at ~0.3 K/h, so an SCT at 200 µm/K drifts ~5 µm across a 300 s sub. Read once
+  per frame at readout like every other error term, and snapshotted into `CameraState`
+  (`last_air_c`/`last_optics_c`/`last_focus_drift`) for the header, because the tick keeps stepping
+  the model through a threaded readout.
+
+Traps the code guards, all with tests:
+
+- **`Rig._step_temperature` is now `_step_cooler`.** It was always the *sensor* cooler relaxation;
+  the name was needed for ambient and the collision is silent otherwise.
+- **`FOCUS_TEMPERATURE` was never pushed.** It was seeded once in `setup()` and never written again,
+  so `temp - self._comp_reference` was identically zero and the compensation branch had never
+  executed in the project's life. `Focuser._read_probe` publishes it on `_PROBE_PERIOD_S` (4 s), not
+  at the tick — and the compensation loop therefore sees the probe at the rate a real one does.
+- **The `Weather._light` warning band is one-sided on purpose.** It alerts *below* `MIN_OK` as well
+  as above `MAX_OK` — without which a temperature light could only fire in a heatwave — but the Busy
+  band is only below `MAX_OK`. Mirroring it onto the floor calls an ordinary 30 km/h breeze a warning
+  for being within 15% of the 0–200 km/h span, which is what broke
+  `test_wind_past_the_threshold_raises_an_alert` when it was tried.
+- **"No sensor" is per parameter, not per station.** `Weather._publish` no longer early-returns to a
+  global IDLE when `rig.wind is None`; with wind off and temperature on, two lights are IDLE and one
+  is live, and the vector state comes from the live one. A global IDLE tells a scheduler the whole
+  station is down.
+- **The lags are exact against a *held* target, not a moving one.** `1 - exp(-dt/tau)` saturates, so
+  a stalled tick lands *on* the target instead of sailing past a 40-minute constant; but a large step
+  treats the air as held for its whole duration. The error is tens of microkelvin at the tick's
+  `MAX_STEP_S`, so the test pins that bound rather than an exactness the model does not have.
+- **The night is anchored on `elapsed_s` plus `hours_into_night`**, never on a sun ephemeris — the
+  same rule that keeps astropy out of `step()`. Consequence: sessions started at different clock
+  times behave identically.
+
+Cost is a handful of floats per tick and no arrays. `build_rig` logs the derived steps/K, the drift a
+full night produces and **the resulting HFD**, because µm/K against this rig's `focus_range` is the
+unit trap: the shipped `focus_range = 1000` is a far looser focus tolerance than a real f/5 system,
+so 20 µm/K over 10 K only reaches HFD ~3.09 where 200 µm/K reaches ~20.
+
 ### One photometric scale
 
 Point sources go through `magnitude_to_electrons`, extended ones through
@@ -453,7 +514,10 @@ Devices push continuously, so call `client.mark()` before sending the command un
   it are that element's content, so no resynchronisation exists. Other clients are unaffected, and
   a test pins that.
 - `seed` in the config is a fixed RNG seed shared by pointing noise, sensor noise and hot pixels, so
-  a run is reproducible; set it to `None` for OS entropy.
+  a run is reproducible; set it to `None` for OS entropy. `wind.py` and `temperature.py` each spawn
+  their own stream from it (`0x77494E44`, `0x54454D50`) rather than drawing from `rig.rng`, because
+  `actual_pointing` draws from that one on every read — a shared stream would make either model
+  depend on how many times unrelated code touched a property.
 - Hot pixels are dark current: `add_hot_pixels` scales by exposure time via `sensor.hot_pixel_e_s`.
   Adding a fixed fraction of full well instead (the original) saturated all of them in a 0.5 s guide
   frame, so 20 immobile pixels outshone the brightest real star ~100x and a guider calibrated

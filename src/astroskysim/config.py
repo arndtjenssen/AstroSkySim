@@ -81,10 +81,24 @@ class Focuser(BaseModel):
     #: the star bloats as you defocus.
     focus_range: int = Field(1000, gt=0)
     backlash: int = Field(0, ge=0)
+    #: Focuser travel per step, um. Load-bearing: it is what turns
+    #: ``temperature.focus_shift_um_per_c`` into steps, so a rig with a 2 um
+    #: step drifts half as many steps for the same physical shift. Real values
+    #: run 0.1-4 um depending on motor and pitch (an Optec TCF-S is 2.16).
     step_size_um: float = Field(1.0, gt=0)
     speed_steps_s: float = Field(2000.0, gt=0)
+    #: Fixed ambient temperature reported when ``[temperature]`` is off, so a
+    #: client still sees a plausible reading rather than nothing.
     temperature: float = 12.0
-    #: steps per degree C, applied when temperature compensation is enabled.
+    #: Steps per degree C the *client's* compensation applies, when it enables
+    #: ``FOCUS_TEMPERATURE_COMPENSATION``.
+    #:
+    #: Deliberately independent of ``temperature.focus_shift_um_per_c``, which is
+    #: what the telescope actually does. One is the correction, the other is the
+    #: error, and keeping them separate is what lets a mis-calibrated coefficient
+    #: over- or under-correct. ``focus_shift_um_per_c / step_size_um`` is the
+    #: perfectly calibrated value - and it still under-corrects, because the
+    #: probe reads the air and focus follows the optics.
     temp_coeff: float = 0.0
 
 
@@ -275,6 +289,133 @@ class WindConfig(BaseModel):
         r = self.axis_ratio_ra_dec
         norm = (1.0 + r * r) ** 0.5
         return r / norm, 1.0 / norm
+
+
+class TemperatureConfig(BaseModel):
+    """Ambient temperature over a night, and the focus drift it causes.
+
+    A night cools. Dusk to dawn is 5-15 K at a lowland site, and warm and cold
+    air masses pass over on top of that. Focus follows, because the tube
+    lengthens and shortens and the glass changes index: 15-25 um/K on an
+    aluminium-tube refractor, 150-350 um/K on a Schmidt-Cassegrain, where the
+    secondary amplifies the primary-secondary spacing change by m^2 ~ 25. So an
+    autofocus run goes stale, and the staler it gets the softer the subs.
+
+    **Three temperatures, and the gap between them is the feature.** This is the
+    thermal analogue of ``mount.ra_deg`` versus ``actual_pointing``:
+
+    * ``air_c`` - ambient, what ``WEATHER_TEMPERATURE`` reports.
+    * ``probe_c`` - a sensor on the focuser body, what ``FOCUS_TEMPERATURE``
+      reports. Lags the air a little.
+    * ``optics_c`` - the tube and glass, which nothing reports and which is what
+      actually sets focus. Lags a lot more.
+
+    A client that calibrates ``focuser.temp_coeff`` against the probe and
+    compensates perfectly *still* drifts, because focus follows the optics. That
+    is the real, widely-misdiagnosed failure - a ZWO EAF's sensor sits at the
+    focuser, not on the tube - and it is what makes temperature compensation
+    worth testing against. Drive focus from ``air_c`` instead and a correct
+    coefficient works perfectly, leaving nothing to find.
+    """
+
+    #: Off by default, for the same reason ``wind.enabled`` is: every measured
+    #: HFD in the test suite was taken at a fixed focus, so a default of ``true``
+    #: would drift all of them.
+    enabled: bool = False
+
+    # -- the night ---------------------------------------------------------
+    #: Ambient when the session opens, degrees C.
+    start_c: float = 16.0
+    #: Total fall from ``start_c`` toward the asymptote. The floor is derived
+    #: (``start_c - night_drop_c``) rather than configured, so the two cannot be
+    #: set inconsistently.
+    night_drop_c: float = Field(10.0, ge=0)
+    #: Time constant of that fall, hours. Measured nocturnal-boundary-layer
+    #: constants run 3-8 h, shortest in enclosed basins and longest over plains.
+    tau_hours: float = Field(5.0, gt=0)
+    #: How far into the night the session starts, hours. 0 opens at dusk with
+    #: the whole drop ahead; 3 opens most of the way down it. This is what makes
+    #: a 03:00 session behave like one, without a sun ephemeris in the tick.
+    hours_into_night: float = Field(0.0, ge=0)
+
+    # -- spells and wander -------------------------------------------------
+    #: Peak excursion of a warm or cold spell, degrees C. **Signed per spell**:
+    #: the draw is symmetric about zero, so warm spells are as common as cold
+    #: ones and the night is not a monotonic slide.
+    spell_amplitude_c: float = Field(2.5, ge=0)
+    #: Fraction of the session spent in a spell. The gate is a two-state Markov
+    #: chain whose off-rate divides by this, so ``1.0`` would divide by zero -
+    #: hence ``lt``, exactly as in ``wind.probability``.
+    spell_probability: float = Field(0.25, ge=0.0, lt=1.0)
+    #: Mean length of one spell, seconds.
+    spell_duration_s: float = Field(900.0, gt=0)
+    #: How fast a spell arrives, seconds. Air does not step: a discontinuity
+    #: here would put one straight into the focus drift, and a focuser that
+    #: jumps is a bug report rather than weather.
+    spell_ramp_s: float = Field(180.0, gt=0)
+    #: Background wander, degrees C RMS. Measured per-night sigma is 0.77 at La
+    #: Palma and 1.30 at Macon; a lowland back garden sits at the top of that.
+    #: Small by default so the spells stay legible against it.
+    sigma_c: float = Field(0.15, ge=0)
+    #: Correlation time of that wander, seconds. Minutes, not seconds: mesoscale
+    #: fluctuations are not universal the way microscale turbulence is, and one
+    #: minute is the usual averaging compromise.
+    noise_tau_s: float = Field(300.0, gt=0)
+
+    # -- what lags what ----------------------------------------------------
+    #: Time constant with which the optics follow the air, seconds. ~40 min for
+    #: a refractor's lens cell; hours for a thick mirror, and longer still for a
+    #: Maksutov meniscus at ~10% of aperture. Cooling is limited by conduction
+    #: through the glass, not by airflow past it, which is why a fan helps far
+    #: less than its size suggests.
+    optics_tau_s: float = Field(2400.0, gt=0)
+    #: Time constant of the focuser's own temperature probe, seconds. Short,
+    #: because it sits in the airflow rather than in the glass. Setting it equal
+    #: to ``optics_tau_s`` models a mid-tube probe (an Optec TCF-SI) instead,
+    #: which is why one rig calibrates reproducibly and another does not.
+    probe_tau_s: float = Field(300.0, gt=0)
+
+    # -- how much focus a degree costs -------------------------------------
+    #: Focuser travel per degree of cooling, um/K. **Signed, and the sign is the
+    #: trap**: positive means cooling racks the focuser *out*, to a higher step
+    #: number, which is the direction every measured slope reports.
+    #:
+    #: One lumped constant, like ``wind.response_arcsec_at_20kmh``, standing in
+    #: for tube CTE, glass dn/dT and secondary amplification together. Not
+    #: derived from a tube-material setting on purpose: the Cassegrain
+    #: amplification is m^2 and m runs 1.5-5 across designs, so a single
+    #: "cassegrain" constant would be wrong for most rigs. Measured and inferred
+    #: values, and ``build_rig`` logs what yours costs in HFD:
+    #:
+    #: ===========================  =========  ================================
+    #: tube                         um/K       basis
+    #: ===========================  =========  ================================
+    #: refractor, aluminium         15-25      measured; CTE 23 ppm/K x f
+    #: refractor, carbon            5-12       inference; only the glass is left
+    #: Newtonian, aluminium         20-25      CTE x f, no amplification
+    #: Newtonian, steel / carbon    10-13 / 2-6  CTE 12 / ~0-1 ppm/K
+    #: Maksutov                     150-300    **inference only**, m ~ 6
+    #: SCT, C8 f/10                 150-260    three independent routes agree
+    #: SCT, C11 / C14               ~300 / ~350  C14 measured at 161 steps/K
+    #: ===========================  =========  ================================
+    #:
+    #: Converted to steps through ``focuser.step_size_um``.
+    focus_shift_um_per_c: float = 20.0
+    #: Temperature at which ``focuser.perfect_focus`` really is perfect.
+    #: Defaults to ``start_c``, so a session opens in focus and everything after
+    #: it is drift.
+    reference_c: float | None = None
+
+    @model_validator(mode="after")
+    def _resolve_reference(self) -> TemperatureConfig:
+        if self.reference_c is None:
+            self.reference_c = self.start_c
+        return self
+
+    @property
+    def floor_c(self) -> float:
+        """Asymptote of the cooling curve; derived, never configured."""
+        return self.start_c - self.night_drop_c
 
 
 class Optics(BaseModel):
@@ -488,6 +629,9 @@ class Config(BaseModel):
     mount: MountConfig = Field(default_factory=MountConfig)
     #: Wind, gusts, and the mid-exposure smear they leave. Off by default.
     wind: WindConfig = Field(default_factory=WindConfig)
+    #: Ambient temperature over the night, and the focus drift it causes. Off by
+    #: default.
+    temperature: TemperatureConfig = Field(default_factory=TemperatureConfig)
     optics: Optics = Field(default_factory=Optics)
     source: SourceConfig = Field(default_factory=SourceConfig)
     #: Where the shared satellite configuration lives, and whether to use it.

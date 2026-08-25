@@ -4,6 +4,13 @@ Absolute and relative moves, sync, reverse, temperature compensation and
 backlash. The rig models backlash physically (``focus_backlash``), so a client
 that compensates for it is tested against a focuser that really has it rather
 than against a property it can only read back.
+
+Temperature compensation is the same idea and only became real with
+``[temperature]``: the probe is published from the model on its own cadence, the
+focus point genuinely moves as the night cools, and ``focuser.temp_coeff`` is
+what the *client* applies against it. Getting that coefficient wrong over- or
+under-corrects, and getting it exactly right still leaves a residue, because the
+probe follows the air and focus follows the optics.
 """
 
 from __future__ import annotations
@@ -22,6 +29,13 @@ from ..indi.protocol import (
     Vector,
     parse_number,
 )
+
+#: How often the temperature probe is read, seconds. A real controller polls its
+#: sensor on its own cadence rather than at the server tick, and the coalescing
+#: output queue means a client would only ever see the newest value anyway - so
+#: pushing at 10 Hz would be noise on the wire for nothing. It also means the
+#: compensation loop below sees the temperature at the rate a real one does.
+_PROBE_PERIOD_S = 4.0
 
 
 class Focuser(Device):
@@ -97,6 +111,10 @@ class Focuser(Device):
                 ],
             )
         )
+        # A probe on the focuser body, which is where a ZWO EAF's sensor sits.
+        # It reads the *air*, lagged a little - not the tube and glass, whose
+        # temperature is what actually moves focus and which nothing reports.
+        # That gap is the point; see ``TemperatureConfig``.
         self.temperature = self.add(
             NumberVector(
                 name="FOCUS_TEMPERATURE",
@@ -154,6 +172,8 @@ class Focuser(Device):
             ("FOCUS_BACKLASH_STEPS", self._w_backlash_steps),
         ):
             self.writer(name, fn)
+
+        self._probe_elapsed = _PROBE_PERIOD_S  # publish on the first tick
 
     async def _w_ok(self, vec: Vector, values: dict[str, str]) -> None:
         vec.apply(values)  # type: ignore[attr-defined]
@@ -235,13 +255,41 @@ class Focuser(Device):
             self.rig.focuser.backlash = int(vec["FOCUS_BACKLASH_VALUE"].value)
         self.push(vec, state=PropState.OK)
 
+    def _read_probe(self, dt: float) -> None:
+        """Publish the probe, on its own cadence rather than at the tick rate.
+
+        Before this existed the item was seeded once in ``setup`` and never
+        written again, so ``temp - self._comp_reference`` below was identically
+        zero and the compensation branch could not fire at all.
+        """
+        self._probe_elapsed += dt
+        if self._probe_elapsed < _PROBE_PERIOD_S:
+            return
+        self._probe_elapsed = 0.0
+        model = self.rig.temperature
+        value = self.rig.cfg.focuser.temperature if model is None else model.probe_c
+        self.temperature["TEMPERATURE"].value = value
+        self.push(self.temperature, state=PropState.OK)
+
     async def step(self, dt: float) -> None:
         f = self.rig.focuser
         was_moving = self.absolute.state is PropState.BUSY
 
+        self._read_probe(dt)
+
         if f.temp_comp and self._comp_reference is not None:
+            # ``reference - temp``, so a *positive* temp_coeff racks out as it
+            # cools. That matches both the physical constant this compensates
+            # (``temperature.focus_shift_um_per_c``, positive = cooling extends)
+            # and what real controllers publish - an Optec coefficient is the
+            # negative of the fitted position-versus-temperature slope, and its
+            # default for an SCT is +86. So the perfectly calibrated value here
+            # is ``focus_shift_um_per_c / step_size_um``.
+            #
+            # It still under-corrects, and that is the feature: this reads the
+            # probe, which follows the air, while focus follows the optics.
             temp = float(self.temperature["TEMPERATURE"].value)
-            drift = (temp - self._comp_reference) * self.rig.cfg.focuser.temp_coeff
+            drift = (self._comp_reference - temp) * self.rig.cfg.focuser.temp_coeff
             if abs(drift) >= 1.0 and not f.moving:
                 self._comp_reference = temp
                 self.rig.move_focuser(f.position + drift)

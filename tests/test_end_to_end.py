@@ -13,6 +13,7 @@ from astropy.io import fits
 
 from astroskysim.cli import build_server
 from astroskysim.config import Config, Sensor, SourceMode
+from astroskysim.devices import focuser as focuser_device
 from astroskysim.indi.xml_stream import XmlStreamSplitter, parse_element
 
 
@@ -1241,4 +1242,197 @@ async def test_a_wind_smeared_sub_records_it_in_the_header():
             assert header["WINDKMH"] > 0.0
             assert "GUSTKMH" in header
             assert "SMEARPX" in header
+        await c.close()
+
+
+# --------------------------------------------------------------------------
+# Temperature, and the focus drift it causes.
+#
+# Three temperatures reach a client differently and that is the whole point:
+# WEATHER_TEMPERATURE is the air, FOCUS_TEMPERATURE is a probe on the focuser
+# body, and the optics - which is what actually moves focus - is published by
+# nothing except the FITS header. A client that compensates perfectly against
+# the probe still drifts.
+#
+# The time constants are compressed to seconds here. The tick steps by
+# wall-clock time, so a five-hour tau would need five hours.
+# --------------------------------------------------------------------------
+def cooling_config(**over):
+    cfg = make_config(**over)
+    cfg.server.weather = True
+    cfg.temperature = cfg.temperature.model_copy(
+        update=dict(
+            enabled=True,
+            start_c=16.0,
+            night_drop_c=10.0,
+            tau_hours=0.0006,  # ~2 s, so a night passes while the test watches
+            spell_probability=0.0,
+            spell_amplitude_c=0.0,
+            sigma_c=0.0,
+            optics_tau_s=4.0,
+            probe_tau_s=0.5,
+            focus_shift_um_per_c=200.0,  # an SCT, so the drift is unmissable
+        )
+    )
+    return cfg
+
+
+async def test_the_weather_device_reports_a_falling_temperature():
+    """The fixed 12 C this replaced could never have shown a client anything."""
+    async with Harness(cooling_config()) as h:
+        c = await h.connect()
+        await c.send('<getProperties device="AstroSkySim Weather"/>')
+        await c.pump(0.5)
+
+        first = await c.until(
+            lambda e: e.name == "WEATHER_PARAMETERS" and e.tag == "setNumberVector"
+        )
+        started = float(first.child_values()["WEATHER_TEMPERATURE"])
+        c.mark()
+        later = await c.until(
+            lambda e: e.name == "WEATHER_PARAMETERS"
+            and e.tag == "setNumberVector"
+            and float(e.child_values()["WEATHER_TEMPERATURE"]) < started - 1.0
+        )
+        assert float(later.child_values()["WEATHER_TEMPERATURE"]) < started
+        await c.close()
+
+
+async def test_the_definition_carries_a_real_temperature_not_a_zero():
+    """A client sees the definition before the first publish, up to 4 s later.
+
+    Zero is a neutral placeholder for wind and a freezing night for temperature,
+    and it can trip a MIN_OK threshold before any real reading arrives.
+    """
+    async with Harness(cooling_config()) as h:
+        c = await h.connect()
+        await c.send('<getProperties device="AstroSkySim Weather"/>')
+        await c.pump(0.3)
+        defs = [
+            e
+            for e in c.seen
+            if e.name == "WEATHER_PARAMETERS" and e.tag == "defNumberVector"
+        ]
+        assert defs, "no definition arrived"
+        assert float(defs[0].child_values()["WEATHER_TEMPERATURE"]) == pytest.approx(
+            16.0, abs=0.5
+        )
+        await c.close()
+
+
+async def test_a_temperature_past_its_floor_raises_an_alert():
+    """The low side alerts, unlike wind, whose interesting end is the top."""
+    async with Harness(cooling_config()) as h:
+        c = await h.connect()
+        await c.send('<getProperties device="AstroSkySim Weather"/>')
+        await c.pump(0.5)
+        c.mark()
+        # A floor this night will cross on its way down to 6 C.
+        await c.send(
+            '<newNumberVector device="AstroSkySim Weather" name="WEATHER_TEMPERATURE">'
+            '<oneNumber name="MIN_OK">14</oneNumber>'
+            '<oneNumber name="MAX_OK">40</oneNumber>'
+            '<oneNumber name="PERCENT_WARNING">15</oneNumber></newNumberVector>'
+        )
+        alert = await c.until(
+            lambda e: e.name == "WEATHER_STATUS" and e.get("state") == "Alert"
+        )
+        assert alert is not None
+        await c.close()
+
+
+async def test_the_focus_probe_is_pushed_and_not_only_defined(monkeypatch):
+    """The bug this feature fixes, pinned directly.
+
+    Before this the item was seeded once in ``setup`` and never written again, so
+    a client only ever saw the value in the ``defNumberVector`` - and the
+    temperature-compensation branch, which differences against it, could not
+    fire at all.
+    """
+    monkeypatch.setattr(focuser_device, "_PROBE_PERIOD_S", 0.1)
+    async with Harness(cooling_config()) as h:
+        c = await h.connect()
+        await c.send('<getProperties device="AstroSkySim Focuser"/>')
+        await c.pump(0.5)
+        c.mark()
+        first = await c.until(
+            lambda e: e.name == "FOCUS_TEMPERATURE" and e.tag == "setNumberVector"
+        )
+        started = float(first.child_values()["TEMPERATURE"])
+        moved = await c.until(
+            lambda e: e.name == "FOCUS_TEMPERATURE"
+            and e.tag == "setNumberVector"
+            and float(e.child_values()["TEMPERATURE"]) < started - 0.5
+        )
+        assert moved is not None
+        await c.close()
+
+
+async def test_the_probe_and_the_air_are_not_the_same_number(monkeypatch):
+    """A focuser-body sensor lags the air. Collapsing the two deletes the feature."""
+    monkeypatch.setattr(focuser_device, "_PROBE_PERIOD_S", 0.1)
+    cfg = cooling_config()
+    cfg.temperature = cfg.temperature.model_copy(update=dict(probe_tau_s=6.0))
+    async with Harness(cfg) as h:
+        rig = h.server.rig
+        c = await h.connect()
+        await c.send('<getProperties version="1.7"/>')
+        await c.pump(2.0)
+        assert rig.temperature.probe_c > rig.temperature.air_c + 0.5
+        assert rig.temperature.optics_c > rig.temperature.air_c + 0.5
+        await c.close()
+
+
+async def test_temperature_compensation_moves_the_focuser(monkeypatch):
+    """With the probe live, the client-side loop finally has something to chase."""
+    monkeypatch.setattr(focuser_device, "_PROBE_PERIOD_S", 0.1)
+    cfg = cooling_config()
+    # Perfectly calibrated: focus_shift_um_per_c / step_size_um.
+    cfg.focuser.temp_coeff = 200.0
+    async with Harness(cfg) as h:
+        rig = h.server.rig
+        start = rig.focuser.position
+        c = await h.connect()
+        await c.send('<getProperties device="AstroSkySim Focuser"/>')
+        await c.pump(0.5)
+        c.mark()
+        await c.send(
+            '<newSwitchVector device="AstroSkySim Focuser" '
+            'name="FOCUS_TEMPERATURE_COMPENSATION">'
+            '<oneSwitch name="INDI_ENABLED">On</oneSwitch>'
+            '<oneSwitch name="INDI_DISABLED">Off</oneSwitch></newSwitchVector>'
+        )
+        await c.pump(3.0)
+        # Cooling racks out, so compensation must move to a higher step number.
+        assert rig.focuser.position > start + 100
+        # And it still does not fully catch the drift, because the probe follows
+        # the air while focus follows the optics. That residue is the feature.
+        assert rig.focuser.position != pytest.approx(
+            rig.cfg.focuser.perfect_focus + rig.focus_drift_steps, abs=20
+        )
+        await c.close()
+
+
+async def test_a_thermally_drifted_sub_records_it_in_the_header():
+    """OPTTEMP is the number that drove the defocus and the one nothing publishes."""
+    async with Harness(cooling_config()) as h:
+        c = await h.connect()
+        await c.send('<getProperties device="AstroSkySim CCD"/>')
+        await c.pump(0.4)
+        await c.send('<enableBLOB device="AstroSkySim CCD">Also</enableBLOB>')
+        await c.pump(2.0)  # let the night cool before the shutter opens
+        c.mark()
+        await c.send(
+            '<newNumberVector device="AstroSkySim CCD" name="CCD_EXPOSURE">'
+            '<oneNumber name="CCD_EXPOSURE_VALUE">1.0</oneNumber></newNumberVector>'
+        )
+        blob = await c.until(lambda e: e.tag == "setBLOBVector")
+        import base64
+
+        with fits.open(io.BytesIO(base64.b64decode(blob.children[0].text))) as hdul:
+            header = hdul[0].header
+            assert header["AMBTEMP"] < 16.0
+            assert header["OPTTEMP"] > header["AMBTEMP"]  # the optics lag
+            assert header["FOCDRIFT"] > 0.0  # cooling racks out
+            assert header["HFD"] > 2.4  # and the sub really is soft
         await c.close()

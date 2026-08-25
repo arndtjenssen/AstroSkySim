@@ -522,6 +522,17 @@ class CameraBase(Device):
                 round(cam.last_smear_px, 3),
                 "[px] peak-to-peak wind smear, unbinned",
             )
+        if self.rig.temperature is not None:
+            # Same reasoning again: a client looking at a soft sub cannot
+            # otherwise tell thermal drift from bad seeing or a missed focus
+            # run. OPTTEMP is the number that drove the defocus and the one no
+            # property publishes, which is exactly why it belongs here.
+            h["AMBTEMP"] = (round(cam.last_air_c, 2), "[C] simulated ambient temperature")
+            h["OPTTEMP"] = (round(cam.last_optics_c, 2), "[C] simulated optics temperature")
+            h["FOCDRIFT"] = (
+                round(cam.last_focus_drift, 1),
+                "[steps] thermal focus drift from reference",
+            )
         # numpy row 0 is the bottom row of the FITS image.
         h["ROWORDER"] = "BOTTOM-UP"
         if s.bayer != "MONO":

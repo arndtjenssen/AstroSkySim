@@ -84,6 +84,20 @@ perfect_focus = 15000
 focus_range = 1000    # steps off focus that give HFD ~10
 backlash = 40
 speed_steps_s = 2000.0
+# Focuser travel per step. Load-bearing once [temperature] is on: it is what
+# turns focus_shift_um_per_c into steps, so a coarser focuser drifts fewer steps
+# for the same physical shift. Real values run 0.1-4 um (an Optec TCF-S is 2.16).
+step_size_um = 1.0
+# Steps per degree C the *client's* temperature compensation applies. Zero means
+# it does nothing even when a client switches FOCUS_TEMPERATURE_COMPENSATION on.
+#
+# Deliberately separate from temperature.focus_shift_um_per_c below, which is
+# what the telescope actually does: one is the correction, the other is the
+# error, and setting them apart is how a mis-calibrated coefficient over- or
+# under-corrects. focus_shift_um_per_c / step_size_um is the perfectly
+# calibrated value - and even that leaves a residue, because the probe reads the
+# air and focus follows the optics.
+temp_coeff = 0.0
 
 [rotator]
 speed_deg_s = 4.0
@@ -145,6 +159,59 @@ resonance_hz = 4.0                 # tube-on-mount ring-down; this makes the V-s
 damping = 0.12                     # must be < 1, or there is no ringing at all
 axis_ratio_ra_dec = 1.5            # RA is the softer axis, so spikes land there
 buffet_fraction = 0.25             # high-frequency component of the push
+
+# The night's temperature, and the focus drift it causes. Off by default;
+# uncomment `enabled` to let it cool.
+#
+# Three temperatures, and the gap between them is the point. `air_c` is ambient
+# and is what WEATHER_TEMPERATURE reports. `probe_c` is a sensor on the focuser
+# body - where a ZWO EAF's actually sits - and is what FOCUS_TEMPERATURE reports.
+# `optics_c` is the tube and glass, which nothing publishes and which is what
+# really moves focus. So a client that calibrates focuser.temp_coeff against the
+# probe and compensates perfectly still drifts. That is the real failure and the
+# most misdiagnosed one; driving focus from the air instead would make a correct
+# coefficient work perfectly and leave nothing to test.
+#
+# The unit to watch is um/K against this rig's focus_range, not against a real
+# critical focus zone. focus_range = 1000 above with step_size_um = 1.0 is a much
+# looser tolerance than a real f/5 system has, so 20 um/K over a 10 K night takes
+# HFD from 2.35 to only ~3.09 - while an SCT's 200 um/K reaches ~20. Run
+# `astroskysim -v` and read the line that says what yours costs in HFD.
+#
+# As with wind, a client can only *see* this if server.weather = true above.
+[temperature]
+enabled = true
+start_c = 16.0                 # ambient when the session opens
+night_drop_c = 10.0            # total fall; the floor is derived, not set
+tau_hours = 5.0                # measured nocturnal range is 3-8 h
+hours_into_night = 0.0         # 3.0 opens most of the way down the curve
+spell_amplitude_c = 2.5        # signed per spell, so warm spells as well as cold
+spell_probability = 0.25       # fraction of the session inside a spell
+spell_duration_s = 900.0       # mean length of one
+spell_ramp_s = 180.0           # air does not step, and nor should the focus
+sigma_c = 0.15                 # background wander; per-night sigma is 0.8-1.3
+noise_tau_s = 300.0            # its correlation time - minutes, not seconds
+optics_tau_s = 2400.0          # ~40 min lens cell; hours for a thick mirror
+probe_tau_s = 300.0            # focuser-body probe. Set = optics_tau_s for a
+                               # mid-tube one, which is why an Optec TCF-SI
+                               # calibrates where a control-box probe does not.
+# Focuser travel per degree of *cooling*, um/K. Positive racks out, to a higher
+# step number, which is the direction every measured slope reports. One lumped
+# constant for tube CTE, glass dn/dT and secondary amplification together - not
+# derived from a tube-material setting, because the Cassegrain amplification is
+# m^2 and m runs 1.5-5, so no single "cassegrain" number is right.
+#
+#   refractor, aluminium       15-25   measured
+#   refractor, carbon           5-12   inference; only the glass term is left
+#   Newtonian, aluminium       20-25   CTE x focal length, no amplification
+#   Newtonian, steel / carbon  10-13 / 2-6
+#   Maksutov                  150-300  inference only, no measurement found
+#   SCT, C8 f/10              150-260  three independent routes agree
+#   SCT, C11 / C14            ~300 / ~350
+focus_shift_um_per_c = 20.0
+# Where perfect_focus really is perfect. Defaults to start_c, so a session opens
+# in focus and everything after it is drift.
+# reference_c = 16.0
 
 # Satellite trails. Everything about them - which lists are in the sky, how
 # bright they are, where the elements are cached - lives in its own file, found
