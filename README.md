@@ -1,8 +1,8 @@
 # AstroSkySim
 
 Headless INDI simulator for a full astrophotography rig: mount, imaging camera,
-guide camera, focuser, rotator and filter wheel. Serves INDI on port 7624 — no
-GUI, no desktop application.
+guide camera, focuser, rotator and filter wheel. Serves INDI on port 7625 — no
+GUI, no desktop application. Image sources are either artificial (from local star catalog), online surveys or a composite of both. Satellite streak simulation can be added optionally by downloading satellite databases.
 
 AstroSkySim follows in the footsteps of Han Kleijn's
 [Sky Simulator for Ascom and Alpaca](https://sourceforge.net/projects/sky-simulator),
@@ -20,7 +20,7 @@ uv run astroskysim fetch-satellites               # orbital elements, occasional
 uv run astroskysim -c examples/sim.toml -v
 ```
 
-Then point KStars/Ekos, CCDciel or any INDI client at `localhost:7624`.
+Then point KStars/Ekos, CCDciel or any INDI client at `localhost:7625`.
 
 Run tests with:
 

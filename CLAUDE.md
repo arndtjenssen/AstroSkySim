@@ -32,8 +32,7 @@ comments on `vec.apply(...)` / `vec.selected` are hand-placed for a checker that
 don't trust them as evidence a type is correct.
 
 CLI flags override the TOML (`--port`, `--host`, `--mode`, `--survey`, `--catalog-dir`,
-`--satellites`); everything else is config-only. Note `examples/sim.toml` uses **port 7625**, while the code default and the
-README are 7624.
+`--satellites`); everything else is config-only.
 
 `catalog/` is **gitignored except its README** — the `.290` files are fetched, not committed. Without
 them a synthetic star field is substituted and startup warns: usable for focus, guiding and framing,

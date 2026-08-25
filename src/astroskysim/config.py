@@ -324,7 +324,7 @@ class SatellitesRef(BaseModel):
 
 class ServerConfig(BaseModel):
     host: str = "0.0.0.0"
-    port: int = Field(7624, ge=1, le=65535)
+    port: int = Field(7625, ge=1, le=65535)
     tick_hz: float = Field(10.0, gt=0, le=100)
     device_prefix: str = "AstroSkySim"
     #: Which devices to advertise.
